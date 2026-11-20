@@ -151,7 +151,7 @@ object Reddit {
             lastStatus == 429 -> "O Reddit limitou as consultas. Tente de novo em alguns minutos"
             lastStatus == -1 -> "Sem conexão com o Reddit"
             lastStatus == 403 || lastStatus == 401 || lastStatus == 200 -> if (hasLogin)
-                "O Reddit recusou o acesso mesmo com os cookies (subreddit privado/banido, ou a sessão expirou: abra o reddit.com logado no navegador e cole os cookies de novo)"
+                "O Reddit recusou todas as rotas, até a do login. Sem motivo informado isso é bloqueio da sua rede/IP: desligue VPN/Private DNS/bloqueador ou troque entre Wi-Fi e dados móveis"
                 else "O Reddit recusou o acesso (perfil privado, banido ou bloqueio de rede). Cole os cookies do Reddit nas Configurações"
             else -> "O Reddit respondeu HTTP $lastStatus"
         })
@@ -552,7 +552,13 @@ internal object Arctic {
                         }
                         return j
                     }
-                    else -> { last = "HTTP $st"; if (st in 400..499) break; Thread.sleep(2000) }
+                    else -> {
+                        val why = runCatching { JSONObject(body).optString("error") }.getOrNull()?.takeIf { it.isNotBlank() && it != "null" }
+                            ?: body.replace(Regex("\\s+"), " ").take(120)
+                        last = "HTTP $st" + if (why.isNotBlank()) ": $why" else ""
+                        if (st in 400..499) throw Reddit.Failed(last)
+                        Thread.sleep(2000)
+                    }
                 }
             } catch (e: java.io.IOException) { last = "sem conexão"; Thread.sleep(2000) } finally { c.disconnect() }
         }
@@ -582,9 +588,24 @@ internal object Arctic {
         val out = LinkedHashMap<String, JSONObject>()
         var before: Long? = null
         var seen = 0
+        // a API recusou (422) a combinação usada antes: a 1ª página testa variações e fica com a que funcionar
+        val variants = listOf("&limit=100&sort=desc", "&limit=100&sort=desc&after=0", "&limit=100", "&sort=desc", "")
+        var extra: String? = null
         for (page in 1..MAX_PAGES) {
             onProgress("Listando posts no arquivo… ${out.size} com mídia de $seen")
-            val data = get("/api/posts/search?$who&limit=100&sort=desc" + (before?.let { "&before=$it" } ?: "")).optJSONArray("data")
+            val beforeQ = before?.let { "&before=$it" } ?: ""
+            val data = try {
+                if (extra == null) {
+                    var lastErr: Reddit.Failed? = null
+                    var got: JSONArray? = null
+                    for (v in variants) {
+                        try { got = get("/api/posts/search?$who$v$beforeQ").optJSONArray("data"); extra = v; break }
+                        catch (e: Reddit.Failed) { lastErr = e; if ("422" !in e.message.orEmpty() && "400" !in e.message.orEmpty()) throw e }
+                    }
+                    if (extra == null) throw lastErr ?: Reddit.Failed("sem resposta")
+                    got
+                } else get("/api/posts/search?$who$extra$beforeQ").optJSONArray("data")
+            } catch (e: Reddit.Failed) { if (out.isEmpty()) throw e; break }
             if (data == null || data.length() == 0) break
             var oldest = Long.MAX_VALUE
             for (i in 0 until data.length()) {
