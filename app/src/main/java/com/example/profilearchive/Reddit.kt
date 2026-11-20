@@ -68,7 +68,11 @@ object Reddit {
      *     o bloqueio do Reddit é para clientes que não são navegador, e ela é um navegador;
      *  3. www e old.reddit por HTTP simples, com User-Agent de app e de navegador.
      */
+    /** Até quando o Reddit está recusando tudo (as consultas vão direto para o arquivo, sem insistir). */
+    @Volatile private var blockedUntil = 0L
+
     private fun get(ctx: Context, pathAndQuery: String, onWait: (String) -> Unit): Any {
+        if (System.currentTimeMillis() < blockedUntil) throw Failed("O Reddit está recusando o acesso")
         val cookies = CookieStore.cookiesOf(ctx, "reddit")
         val cookie = cookies.joinToString("; ") { "${it.name}=${it.value}" }
         val token = bearer(cookies)
@@ -89,7 +93,11 @@ object Reddit {
                 c.setRequestProperty("Accept", "application/json")
                 c.setRequestProperty("Authorization", "Bearer $token")
                 lastStatus = c.responseCode
-                trace += "oauth $lastStatus"
+                trace += "oauth $lastStatus" + if (lastStatus == 403) {
+                    // o Reddit diz o motivo no corpo do 403 (subreddit privado, em quarentena, banido…)
+                    val why = runCatching { JSONObject(c.errorStream.bufferedReader().use { it.readText() }).optString("reason") }.getOrNull()
+                    if (why.isNullOrBlank()) "" else " ($why)"
+                } else ""
                 val reset = c.getHeaderField("x-ratelimit-reset")?.toLongOrNull()?.coerceAtMost(120) ?: 60
                 when (lastStatus) {
                     200 -> {
@@ -138,6 +146,7 @@ object Reddit {
         }
 
         val hasLogin = cookies.any { it.name == "reddit_session" || it.name == "token_v2" }
+        if (lastStatus == 403 || lastStatus == 401) blockedUntil = System.currentTimeMillis() + 30 * 60_000L
         throw Failed("[" + trace.distinct().joinToString(" · ") + "] " + when {
             lastStatus == 429 -> "O Reddit limitou as consultas. Tente de novo em alguns minutos"
             lastStatus == -1 -> "Sem conexão com o Reddit"
@@ -232,6 +241,17 @@ object Reddit {
      * então junta "novos" com "top de todos os tempos" para alcançar mais posts antigos.
      */
     fun list(ctx: Context, username: String, onProgress: (String) -> Unit): List<JSONObject> {
+        val direct = try { listDirect(ctx, username, onProgress) } catch (e: Failed) {
+            if ("Não encontrado" in e.message.orEmpty()) throw e
+            onProgress("O Reddit recusou o acesso; buscando no arquivo público (Arctic Shift)…")
+            return try { Arctic.list(username, onProgress) } catch (a: Failed) {
+                throw Failed("${e.message}\n\nArquivo público (Arctic Shift) também falhou: ${a.message}")
+            }
+        }
+        return direct
+    }
+
+    private fun listDirect(ctx: Context, username: String, onProgress: (String) -> Unit): List<JSONObject> {
         val meta = profileMeta(ctx, username, onProgress)
         val base = if (isSubreddit(username)) listOf("${path(username)}/new.json?", "${path(username)}/top.json?t=all&")
             else listOf("${path(username)}/submitted.json?sort=new&", "${path(username)}/submitted.json?sort=top&t=all&")
@@ -305,7 +325,7 @@ object Reddit {
     }
 
     /** Post da API → entrada no formato das do yt-dlp. Posts só de texto ou link externo ficam de fora. */
-    private fun toEntry(post: JSONObject, meta: JSONObject): JSONObject? {
+    internal fun toEntry(post: JSONObject, meta: JSONObject): JSONObject? {
         // crosspost: a mídia está no post original
         val p = post.optJSONArray("crosspost_parent_list")?.optJSONObject(0) ?: post
         val id = post.optString("id").ifBlank { return null }
@@ -344,13 +364,14 @@ object Reddit {
     private fun simplify(children: JSONArray?, depth: Int = 0): JSONArray {
         val out = JSONArray()
         for (c in children.objects()) {
-            val d = c.optJSONObject("data") ?: continue
-            when (c.optString("kind")) {
+            // formato do Reddit {kind, data}; se o arquivo mandar o comentário "solto", usa ele mesmo
+            val d = c.optJSONObject("data") ?: c.takeIf { it.has("body") } ?: continue
+            when (c.optString("kind").ifBlank { "t1" }) {
                 "t1" -> out.put(JSONObject().apply {
                     put("a", d.optString("author")); put("b", d.optString("body"))
                     put("s", d.optLong("score")); put("t", d.optLong("created_utc"))
                     if (d.optBoolean("is_submitter")) put("op", true)
-                    val replies = d.optJSONObject("replies")?.optJSONObject("data")?.optJSONArray("children")
+                    val replies = d.optJSONObject("replies")?.optJSONObject("data")?.optJSONArray("children") ?: d.optJSONArray("replies")
                     if (replies != null && replies.length() > 0) put("r", simplify(replies, depth + 1))
                 })
                 "more" -> d.optInt("count").takeIf { it > 0 }?.let { out.put(JSONObject().put("more", it)) }
@@ -372,10 +393,16 @@ object Reddit {
         need.forEachIndexed { i, (id, _) ->
             onProgress("Baixando comentários ${i + 1} de ${need.size}…")
             runCatching {
-                val res = get(ctx, "comments/$id.json?raw_json=1&limit=500&depth=10&sort=top", onProgress) as JSONArray
-                val tree = simplify(res.optJSONObject(1)?.optJSONObject("data")?.optJSONArray("children"))
-                val count = res.optJSONObject(0)?.optJSONObject("data")?.optJSONArray("children")?.optJSONObject(0)
-                    ?.optJSONObject("data")?.optLong("num_comments") ?: 0
+                val (tree, count) = try {
+                    val res = get(ctx, "comments/$id.json?raw_json=1&limit=500&depth=10&sort=top", onProgress) as JSONArray
+                    simplify(res.optJSONObject(1)?.optJSONObject("data")?.optJSONArray("children")) to
+                        (res.optJSONObject(0)?.optJSONObject("data")?.optJSONArray("children")?.optJSONObject(0)
+                            ?.optJSONObject("data")?.optLong("num_comments") ?: 0)
+                } catch (e: Failed) {
+                    if ("limitou" in e.message.orEmpty()) throw e
+                    val t = simplify(Arctic.comments(id))
+                    t to countComments(t)
+                }
                 val f = commentsFile(dir, id)
                 val tmp = File(f.parentFile, f.name + ".part")
                 tmp.writeText(JSONObject().put("count", count).put("fetched", now / 1000).put("comments", tree).toString())
@@ -383,6 +410,11 @@ object Reddit {
             }.onFailure { if (it is Failed && "limitou" in it.message.orEmpty()) return }   // limite: para e tenta na próxima vez
             Thread.sleep(600)
         }
+    }
+
+    private fun countComments(a: JSONArray): Long = (0 until a.length()).sumOf { i ->
+        val c = a.optJSONObject(i) ?: return@sumOf 0L
+        if (c.has("more")) c.optLong("more") else 1L + (c.optJSONArray("r")?.let { countComments(it) } ?: 0L)
     }
 
     /** Comentário achatado para a lista (profundidade = recuo). */
@@ -485,4 +517,90 @@ internal object RedditWeb {
         main.postDelayed(stop, 90_000)
         res ?: Res(-1, "sem resposta em 45 s", null, 60)
     }
+}
+
+/**
+ * Arctic Shift (arctic-shift.photon-reddit.com): arquivo público do Reddit, que guarda os posts e
+ * comentários com os mesmos campos da API do Reddit (mídia, galerias, vídeo do v.redd.it). Usado quando
+ * o Reddit recusa o acesso. As mídias continuam vindo de i.redd.it / v.redd.it.
+ * Os posts entram no arquivo na hora em que são publicados; pontos e nº de comentários se atualizam em ~36 h.
+ */
+internal object Arctic {
+    private const val BASE = "https://arctic-shift.photon-reddit.com"
+    private const val UA = "android:com.example.profilearchive:v2.0 (archive app)"
+    private const val MAX_PAGES = 100                       // até 10 mil posts por verificação
+
+    private fun get(pathAndQuery: String): JSONObject {
+        var last = ""
+        for (attempt in 0..3) {
+            val c = URL("$BASE$pathAndQuery").openConnection() as HttpURLConnection
+            try {
+                c.connectTimeout = 15_000; c.readTimeout = 60_000
+                c.setRequestProperty("User-Agent", UA)
+                c.setRequestProperty("Accept", "application/json")
+                val st = c.responseCode
+                val body = (if (st < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                when {
+                    st == 429 -> { Thread.sleep(((c.getHeaderField("X-RateLimit-Reset")?.toLongOrNull() ?: 10).coerceIn(1, 60) + 1) * 1000) }
+                    st == 200 -> {
+                        val j = runCatching { JSONObject(body) }.getOrNull() ?: throw Reddit.Failed("resposta inválida do arquivo")
+                        val err = j.optString("error")
+                        if (err.isNotBlank() && err != "null") {
+                            last = err
+                            if ("timed out" in err.lowercase()) { Thread.sleep(2000); continue }
+                            throw Reddit.Failed(err)
+                        }
+                        return j
+                    }
+                    else -> { last = "HTTP $st"; if (st in 400..499) break; Thread.sleep(2000) }
+                }
+            } catch (e: java.io.IOException) { last = "sem conexão"; Thread.sleep(2000) } finally { c.disconnect() }
+        }
+        throw Reddit.Failed(last.ifBlank { "sem resposta" })
+    }
+
+    private fun enc(s: String) = java.net.URLEncoder.encode(s, "UTF-8")
+
+    /** Dados do subreddit (nome, descrição, inscritos e ícone, se o arquivo tiver). */
+    private fun meta(username: String): JSONObject = runCatching {
+        if (!Reddit.isSubreddit(username)) return JSONObject()
+        val d = get("/api/subreddits/search?subreddit=${enc(Reddit.nameOf(username))}&limit=1").optJSONArray("data")?.optJSONObject(0)
+            ?: return JSONObject()
+        fun url(vararg keys: String) = keys.firstNotNullOfOrNull { k -> d.optString(k).takeIf { it.startsWith("http") } }
+        JSONObject().apply {
+            putOpt("pa_avatar", url("community_icon", "icon_img"))
+            putOpt("pa_bio", d.optString("public_description").ifBlank { null })
+            putOpt("pa_name", d.optString("title").ifBlank { null })
+            if (d.has("subscribers")) put("pa_followers", d.optLong("subscribers"))
+        }
+    }.getOrDefault(JSONObject())
+
+    /** Todos os posts com mídia do subreddit/usuário, do mais novo para o mais antigo. */
+    fun list(username: String, onProgress: (String) -> Unit): List<JSONObject> {
+        val meta = meta(username)
+        val who = if (Reddit.isSubreddit(username)) "subreddit=${enc(Reddit.nameOf(username))}" else "author=${enc(Reddit.nameOf(username))}"
+        val out = LinkedHashMap<String, JSONObject>()
+        var before: Long? = null
+        var seen = 0
+        for (page in 1..MAX_PAGES) {
+            onProgress("Listando posts no arquivo… ${out.size} com mídia de $seen")
+            val data = get("/api/posts/search?$who&limit=100&sort=desc" + (before?.let { "&before=$it" } ?: "")).optJSONArray("data")
+            if (data == null || data.length() == 0) break
+            var oldest = Long.MAX_VALUE
+            for (i in 0 until data.length()) {
+                val p = data.optJSONObject(i) ?: continue
+                seen++
+                p.optLong("created_utc").takeIf { it > 0 }?.let { oldest = minOf(oldest, it) }
+                Reddit.toEntry(p, meta)?.let { out.putIfAbsent(it.getString("id"), it) }
+            }
+            if (data.length() < 100 || oldest == Long.MAX_VALUE || oldest == before) break
+            before = oldest
+            Thread.sleep(400)
+        }
+        if (seen == 0) throw Reddit.Failed("nada arquivado para ${Reddit.handle(username)}")
+        return out.values.toList()
+    }
+
+    /** Árvore de comentários de um post (formato do Reddit: {kind, data{…, replies}}). */
+    fun comments(id: String): JSONArray = get("/api/comments/tree?link_id=t3_$id&limit=9999").optJSONArray("data") ?: JSONArray()
 }
