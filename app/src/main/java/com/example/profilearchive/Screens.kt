@@ -3,6 +3,10 @@
 package com.example.profilearchive
 
 import kotlinx.coroutines.coroutineScope
+import androidx.compose.foundation.interaction.DragInteraction
+import kotlinx.coroutines.flow.takeWhile
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.async
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.FocusRequester
@@ -344,6 +348,15 @@ fun HomeScreen(nav: NavController, openMenu: () -> Unit) {
             launch { list.animateScrollToItem(0) }
             animate(scroll.state.heightOffset, 0f) { v, _ -> scroll.state.heightOffset = v }
             scroll.state.contentOffset = 0f
+            // O perfil sobe na lista (ordem por atualização) só quando o worker grava a linha, depois daqui.
+            // O LazyColumn segura o item que estava visível e o perfil novo ficava escondido acima do topo:
+            // por 20 s, item novo entrando em cima traz a lista junto. Arrastar a lista encerra isso.
+            val drag = async { list.interactionSource.interactions.first { it is DragInteraction.Start } }
+            withTimeoutOrNull(20_000) {
+                snapshotFlow { list.firstVisibleItemIndex }.takeWhile { !drag.isCompleted }
+                    .collect { if (it != 0) list.animateScrollToItem(0) }
+            }
+            drag.cancel()
         }
         LaunchedEffect(active) {
             val fresh = active.filter { HomeScroll.seen.add(it) }

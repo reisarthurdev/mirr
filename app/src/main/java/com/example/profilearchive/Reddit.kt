@@ -73,6 +73,8 @@ object Reddit {
         val cookie = cookies.joinToString("; ") { "${it.name}=${it.value}" }
         val token = bearer(cookies)
         var lastStatus = 0
+        val trace = ArrayList<String>()                    // o que cada rota respondeu (vai na mensagem de erro)
+        if (token == null) trace += if (cookies.any { it.name == "token_v2" }) "token_v2 vencido" else "sem token_v2"
 
         fun waitLimit(remaining: Double?, reset: Long) {
             if (remaining != null && remaining < 2) { onWait("Limite do Reddit, continuando em ${reset + 1} s…"); Thread.sleep((reset + 1) * 1000) }
@@ -87,6 +89,7 @@ object Reddit {
                 c.setRequestProperty("Accept", "application/json")
                 c.setRequestProperty("Authorization", "Bearer $token")
                 lastStatus = c.responseCode
+                trace += "oauth $lastStatus"
                 val reset = c.getHeaderField("x-ratelimit-reset")?.toLongOrNull()?.coerceAtMost(120) ?: 60
                 when (lastStatus) {
                     200 -> {
@@ -98,13 +101,15 @@ object Reddit {
                     404 -> throw Failed("Não encontrado no Reddit (o nome está certo?)")
                     else -> break
                 }
-            } catch (e: java.io.IOException) { lastStatus = -1; break } finally { c.disconnect() }
+            } catch (e: java.io.IOException) { lastStatus = -1; trace += "oauth sem conexão"; break } finally { c.disconnect() }
         }
 
         // 2) WebView
         for (attempt in 0..2) {
-            val r = RedditWeb.fetch(ctx, cookies, "https://www.reddit.com/$pathAndQuery") ?: break   // WebView indisponível
+            val r = RedditWeb.fetch(ctx, cookies, "https://www.reddit.com/$pathAndQuery")
+            if (r == null) { trace += "webview indisponível"; break }
             lastStatus = r.status
+            trace += "webview ${r.status}" + if (r.status == 200 && parse(r.body) == null) " (página: ${r.body.replace(Regex("\\s+"), " ").take(60)})" else ""
             when (r.status) {
                 200 -> { parse(r.body)?.let { waitLimit(r.remaining, r.reset); return it }; break }
                 429 -> { onWait("O Reddit pediu uma pausa, continuando em ${r.reset + 1} s…"); Thread.sleep((r.reset + 1) * 1000) }
@@ -123,6 +128,7 @@ object Reddit {
                 c.setRequestProperty("Accept", "application/json")
                 if (cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
                 val st = c.responseCode
+                trace += "${host.removePrefix("https://").substringBefore('.')} $st"
                 if (lastStatus == 0 || st != 403) lastStatus = st
                 when (st) {
                     200 -> parse(c.inputStream.bufferedReader().use { it.readText() })?.let { return it }
@@ -132,7 +138,7 @@ object Reddit {
         }
 
         val hasLogin = cookies.any { it.name == "reddit_session" || it.name == "token_v2" }
-        throw Failed(when {
+        throw Failed("[" + trace.distinct().joinToString(" · ") + "] " + when {
             lastStatus == 429 -> "O Reddit limitou as consultas. Tente de novo em alguns minutos"
             lastStatus == -1 -> "Sem conexão com o Reddit"
             lastStatus == 403 || lastStatus == 401 || lastStatus == 200 -> if (hasLogin)
@@ -398,9 +404,10 @@ object Reddit {
 }
 
 /**
- * WebView invisível (sem tela) que pede o .json do Reddit de dentro do próprio reddit.com, com os
- * cookies colados. Fica viva entre as consultas de uma verificação e é destruída 90 s depois da última.
- * Chamar fora da thread principal: espera a resposta.
+ * WebView invisível (sem tela) que ABRE a URL do .json como uma página, exatamente como digitar o
+ * endereço no Chrome logado: mesmos cabeçalhos de navegação, mesmos cookies, User-Agent de Chrome.
+ * O texto da página (o JSON) é lido por JavaScript. Fica viva entre as consultas de uma verificação
+ * e é destruída 90 s depois da última. Chamar fora da thread principal: espera a resposta.
  */
 @android.annotation.SuppressLint("SetJavaScriptEnabled")
 internal object RedditWeb {
@@ -408,59 +415,74 @@ internal object RedditWeb {
 
     private val main = android.os.Handler(android.os.Looper.getMainLooper())
     private var web: android.webkit.WebView? = null
-    private var page: java.util.concurrent.CompletableFuture<Boolean>? = null
-    private val pending = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.CompletableFuture<Res>>()
+    private val lock = Any()
+    private val stop = Runnable { web?.destroy(); web = null }
+
+    // pedido em andamento (um por vez)
+    @Volatile private var curId = 0
+    @Volatile private var curStatus = 200
+    @Volatile private var curFuture: java.util.concurrent.CompletableFuture<Res>? = null
     private val ids = java.util.concurrent.atomic.AtomicInteger()
-    private val stop = Runnable { web?.destroy(); web = null; page = null }
 
     class Bridge {
         @android.webkit.JavascriptInterface
-        fun done(id: Int, status: Int, remaining: String?, reset: String?, body: String?) {
-            pending.remove(id)?.complete(Res(status, body.orEmpty(), remaining?.toDoubleOrNull(), reset?.toDoubleOrNull()?.toLong()?.coerceIn(1, 120) ?: 60))
+        fun page(id: Int, text: String?) {
+            if (id == curId) curFuture?.complete(Res(curStatus, text.orEmpty(), null, 60))
         }
     }
 
-    /** null = WebView indisponível neste aparelho (ou não carregou). */
-    fun fetch(ctx: Context, cookies: List<CookieStore.Cookie>, url: String): Res? {
+    private fun create(ctx: Context, cookies: List<CookieStore.Cookie>): android.webkit.WebView {
+        val cm = android.webkit.CookieManager.getInstance()
+        cm.setAcceptCookie(true)
+        cookies.forEach { c ->
+            val domain = c.domain.ifBlank { ".reddit.com" }
+            cm.setCookie("https://www.reddit.com", "${c.name}=${c.value}; Domain=$domain; Path=/; Secure")
+        }
+        cm.flush()
+        return android.webkit.WebView(ctx.applicationContext).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.blockNetworkImage = true
+            // UA do Chrome de verdade (sem o "; wv" e o "Version/4.0" que denunciam a WebView)
+            settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\S+ "), "")
+            cm.setAcceptThirdPartyCookies(this, true)
+            addJavascriptInterface(Bridge(), "PA")
+            webViewClient = object : android.webkit.WebViewClient() {
+                override fun onReceivedHttpError(view: android.webkit.WebView, req: android.webkit.WebResourceRequest,
+                                                 resp: android.webkit.WebResourceResponse) {
+                    if (req.isForMainFrame) curStatus = resp.statusCode
+                }
+                override fun onReceivedError(view: android.webkit.WebView, req: android.webkit.WebResourceRequest,
+                                             err: android.webkit.WebResourceError) {
+                    if (req.isForMainFrame) curFuture?.complete(Res(-1, err.description?.toString().orEmpty(), null, 60))
+                }
+                override fun onPageFinished(view: android.webkit.WebView, u: String) {
+                    val id = curId
+                    view.evaluateJavascript("PA.page($id, document.body ? document.body.innerText : (document.documentElement ? document.documentElement.innerText : ''))", null)
+                }
+            }
+        }
+    }
+
+    /** null = WebView indisponível neste aparelho. */
+    fun fetch(ctx: Context, cookies: List<CookieStore.Cookie>, url: String): Res? = synchronized(lock) {
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return null
-        val ready = java.util.concurrent.CompletableFuture<java.util.concurrent.CompletableFuture<Boolean>?>()
+        val f = java.util.concurrent.CompletableFuture<Res>()
+        val started = java.util.concurrent.CompletableFuture<Boolean>()
+        val id = ids.incrementAndGet()
         main.post {
             main.removeCallbacks(stop)
             try {
-                if (web == null) {
-                    val cm = android.webkit.CookieManager.getInstance()
-                    cm.setAcceptCookie(true)
-                    cookies.forEach { c -> cm.setCookie("https://www.reddit.com", "${c.name}=${c.value}; Domain=.reddit.com; Path=/; Secure") }
-                    cm.flush()
-                    val loaded = java.util.concurrent.CompletableFuture<Boolean>()
-                    page = loaded
-                    web = android.webkit.WebView(ctx.applicationContext).apply {
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        settings.blockNetworkImage = true
-                        addJavascriptInterface(Bridge(), "PA")
-                        webViewClient = object : android.webkit.WebViewClient() {
-                            override fun onPageFinished(view: android.webkit.WebView, u: String) { loaded.complete(true) }
-                        }
-                        loadUrl("https://www.reddit.com/robots.txt")
-                    }
-                }
-                ready.complete(page)
-            } catch (e: Throwable) { ready.complete(null) }
+                val w = web ?: create(ctx, cookies).also { web = it }
+                curId = id; curStatus = 200; curFuture = f
+                w.loadUrl(url)
+                started.complete(true)
+            } catch (e: Throwable) { started.complete(false) }
         }
-        val loaded = runCatching { ready.get(15, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() ?: return null
-        if (runCatching { loaded.get(25, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() != true) { main.post(stop); return null }
-
-        val id = ids.incrementAndGet()
-        val f = java.util.concurrent.CompletableFuture<Res>()
-        pending[id] = f
-        val js = "fetch(" + JSONObject.quote(url) + ",{credentials:'include',headers:{'Accept':'application/json'}})" +
-            ".then(function(r){return r.text().then(function(t){PA.done($id,r.status,r.headers.get('x-ratelimit-remaining'),r.headers.get('x-ratelimit-reset'),t)})})" +
-            ".catch(function(e){PA.done($id,-1,null,null,String(e))});void 0"
-        main.post { web?.evaluateJavascript(js, null) ?: pending.remove(id)?.complete(Res(-1, "", null, 60)) }
+        if (runCatching { started.get(15, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() != true) { main.post(stop); return null }
         val res = runCatching { f.get(45, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()
-        pending.remove(id)
+        curFuture = null
         main.postDelayed(stop, 90_000)
-        return res ?: Res(-1, "", null, 60)
+        res ?: Res(-1, "sem resposta em 45 s", null, 60)
     }
 }
