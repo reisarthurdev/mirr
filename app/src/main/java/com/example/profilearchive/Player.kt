@@ -48,6 +48,9 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.ui.PlayerView
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
@@ -81,21 +84,31 @@ fun WhiteStatusBarIcons() {
  * - buffers curtos: arquivo local não precisa de 50 s de buffer; começa a tocar em ~250 ms e
  *   os 3 players do feed ocupam bem menos RAM.
  */
-fun buildPlayer(ctx: Context, loop: Boolean): ExoPlayer {
-    val renderers = DefaultRenderersFactory(ctx).setEnableDecoderFallback(true)
+fun buildPlayer(ctx: Context, loop: Boolean, gain: GainProcessor? = null, audioFocus: Boolean = true): ExoPlayer {
+    val renderers = object : DefaultRenderersFactory(ctx) {
+        // ganho de volume (normalização) antes da saída de áudio
+        override fun buildAudioSink(context: Context, enableFloatOutput: Boolean, enableAudioTrackPlaybackParams: Boolean): AudioSink? =
+            if (gain == null) super.buildAudioSink(context, enableFloatOutput, enableAudioTrackPlaybackParams)
+            else DefaultAudioSink.Builder(context)
+                .setEnableFloatOutput(false)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .setAudioProcessors(arrayOf<AudioProcessor>(gain))
+                .build()
+    }.setEnableDecoderFallback(true)
     val load = DefaultLoadControl.Builder()
         .setBufferDurationsMs(2_000, 15_000, 250, 500)
         .build()
     return ExoPlayer.Builder(ctx, renderers).setLoadControl(load).build().apply {
         repeatMode = if (loop) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
-        setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
+        // audioFocus = false: não tira o foco de outro player do app (ex.: vídeo de carrossel x música do post)
+        setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), audioFocus)
     }
 }
 
 @Composable
-fun rememberPlayer(loop: Boolean): ExoPlayer {
+fun rememberPlayer(loop: Boolean, audioFocus: Boolean = true): ExoPlayer {
     val ctx = LocalContext.current
-    val player = remember { buildPlayer(ctx, loop) }
+    val player = remember { buildPlayer(ctx, loop, audioFocus = audioFocus) }
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
         val o = LifecycleEventObserver { _, e -> if (e == Lifecycle.Event.ON_PAUSE) player.pause() }

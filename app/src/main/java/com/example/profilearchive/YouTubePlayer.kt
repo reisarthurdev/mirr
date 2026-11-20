@@ -174,7 +174,7 @@ fun VideoControls(
                 modifier = Modifier.graphicsLayer { scaleX = bump.value; scaleY = bump.value }
                     .clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = .45f)).padding(horizontal = 14.dp, vertical = 6.dp))
         }
-        AnimatedVisibility(visible, Modifier.fillMaxSize(), enter = fadeIn(), exit = fadeOut()) {
+        AnimatedVisibility(visible, Modifier.fillMaxSize(), enter = fadeIn(tween(140)), exit = fadeOut(tween(180))) {
             Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = .35f))) {
                 IconButton({
                     when {

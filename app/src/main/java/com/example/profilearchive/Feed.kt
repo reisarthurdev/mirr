@@ -17,6 +17,8 @@ import org.json.JSONObject
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
@@ -138,7 +140,8 @@ private fun FeedPage(
     profile: Profile, post: Post, player: ExoPlayer?, videoSize: IntSize?,
     active: Boolean, paused: Boolean, hideCaption: Boolean,
     onTap: () -> Unit, onHold: (Boolean) -> Unit,
-    resetZoom: Int = 0, onZoom: (Boolean) -> Unit = {}
+    resetZoom: Int = 0, onZoom: (Boolean) -> Unit = {},
+    onMusic: () -> Unit = {}, onSlideSound: (Boolean) -> Unit = {}
 ) {
     val isTikTok = profile.platform == "tiktok"
     val isReddit = profile.platform == "reddit"
@@ -159,7 +162,7 @@ private fun FeedPage(
         Box(Modifier.fillMaxSize().then(zoom.modifier)) {
         when {
             // TikTok avança as fotos sozinho; Instagram não
-            post.isSlideshow -> Slides(post, active, paused, autoAdvance = isTikTok) { tap() }
+            post.isSlideshow -> Slides(post, active, paused, autoAdvance = isTikTok, zoomed = zoomed, onSlideSound = onSlideSound) { tap() }
             post.isVideo -> {
                 // Sem flicker: a miniatura fica POR BAIXO do vídeo até o player desenhar o 1º frame
                 // nesta superfície (cada troca de superfície zera o aviso de "1º frame").
@@ -205,7 +208,7 @@ private fun FeedPage(
                         onTap = { tap() }
                     )
                 })
-                PausedIcon(active && paused, Modifier.align(Alignment.Center))
+                PausedIcon(active && paused, Modifier.align(Alignment.Center), hidden = zoomed)
             }
             else -> AsyncImage(File(post.mediaPath), null, Modifier.fillMaxSize(), contentScale = TikTokScale)
         }
@@ -213,7 +216,7 @@ private fun FeedPage(
 
         // disco da música (TikTok): toque abre o nome e o autor
         if (isTikTok && !uiHidden) MusicDisc(profile, post,
-            Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 12.dp, bottom = 30.dp))
+            Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 12.dp, bottom = 30.dp), onMusic)
         // Reddit: botão dos comentários salvos
         if (isReddit && !uiHidden) CommentsButton(post,
             Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 8.dp, bottom = 30.dp))
@@ -424,44 +427,89 @@ private fun MusicLine(post: Post) {
         maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
 }
 
-/**
- * Disco da música igual ao TikTok (parado): capa redonda com borda escura, para qualquer música,
- * original ou não. Sem capa baixada usa a foto do perfil. Os dados vêm do .info.json, lido fora da thread principal.
- */
-@OptIn(ExperimentalMaterial3Api::class)
+/** Dados da música do post (do .info.json, lido fora da thread principal). */
 @Composable
-private fun MusicDisc(profile: Profile, post: Post, modifier: Modifier) {
-    val music by produceState<Music?>(null, post.key) {
-        value = withContext(Dispatchers.IO) {
-            val dir = File(post.mediaPath).parentFile ?: return@withContext null
-            runCatching { readMusic(dir, JSONObject(File(metaDir(dir), "${post.key.substringAfter(':')}.info.json").readText())) }.getOrNull()
-        }
+private fun rememberMusic(post: Post): State<Music?> = produceState<Music?>(null, post.key) {
+    value = withContext(Dispatchers.IO) {
+        val dir = File(post.mediaPath).parentFile ?: return@withContext null
+        runCatching { readMusic(dir, JSONObject(File(metaDir(dir), "${post.key.substringAfter(':')}.info.json").readText())) }.getOrNull()
     }
-    var showInfo by remember { mutableStateOf(false) }
+}
+
+/**
+ * Disco da música igual ao TikTok (parado): capa redonda, para qualquer música, original ou não.
+ * Sem capa baixada usa a foto do perfil. Toque abre a folha com nome e autor ([onClick]).
+ */
+@Composable
+private fun MusicDisc(profile: Profile, post: Post, modifier: Modifier, onClick: () -> Unit) {
+    val music by rememberMusic(post)
     val image: Any? = music?.cover ?: profile.avatarPath?.let(::File)
     // capa ocupando o círculo inteiro, sem aro em volta (igual ao app do TikTok)
-    AsyncImage(image, "Música", modifier.size(48.dp).clip(CircleShape).clickable { showInfo = true }, contentScale = ContentScale.Crop)
-    if (showInfo) ModalBottomSheet(onDismissRequest = { showInfo = false }) {
-        val m = music
-        Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp), verticalAlignment = Alignment.CenterVertically) {
-            AsyncImage(image, null, Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF222222)),
-                contentScale = ContentScale.Crop)
-            Spacer(Modifier.width(16.dp))
-            Column(Modifier.weight(1f)) {
-                Text(when {
-                        m == null -> "Música desconhecida"
-                        m.contains -> "Contém: ${m.title ?: "música"}"
-                        m.original -> m.title ?: "Som original"
-                        else -> m.title ?: "Sem nome"
-                    },
-                    style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                val sub = when {
-                    m == null -> "Verifique o perfil de novo para buscar os dados da música"
-                    m.original -> m.author ?: "@${profile.username}"
-                    else -> m.author
-                }
-                if (sub != null) Text(sub, style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+    AsyncImage(image, "Música", modifier.size(48.dp).clip(CircleShape).clickable(onClick = onClick), contentScale = ContentScale.Crop)
+}
+
+/** Conteúdo da folha da música: capa, nome e autor. */
+@Composable
+private fun MusicInfo(profile: Profile, post: Post) {
+    val music by rememberMusic(post)
+    val m = music
+    val image: Any? = m?.cover ?: profile.avatarPath?.let(::File)
+    Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp), verticalAlignment = Alignment.CenterVertically) {
+        AsyncImage(image, null, Modifier.size(64.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF222222)),
+            contentScale = ContentScale.Crop)
+        Spacer(Modifier.width(16.dp))
+        Column(Modifier.weight(1f)) {
+            Text(when {
+                    m == null -> "Música desconhecida"
+                    m.contains -> "Contém: ${m.title ?: "música"}"
+                    m.original -> m.title ?: "Som original"
+                    else -> m.title ?: "Sem nome"
+                },
+                style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            val sub = when {
+                m == null -> "Verifique o perfil de novo para buscar os dados da música"
+                m.original -> m.author ?: "@${profile.username}"
+                else -> m.author
+            }
+            if (sub != null) Text(sub, style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+        }
+    }
+}
+
+/**
+ * Folha que sobe de baixo, desenhada na própria tela do feed (não é uma janela nova como o
+ * ModalBottomSheet): abrir não trava o vídeo e a sombra cobre a tela inteira de uma vez, inclusive
+ * atrás da barra de status. Toque fora, voltar ou arrastar para baixo fecha.
+ */
+@Composable
+private fun FeedSheet(visible: Boolean, onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    val t by animateFloatAsState(if (visible) 1f else 0f,
+        tween(if (visible) 260 else 200, easing = FastOutSlowInEasing), label = "folha")
+    var drag by remember { mutableFloatStateOf(0f) }
+    LaunchedEffect(visible) { if (visible) drag = 0f }
+    if (!visible && t == 0f) return
+    BackHandler(visible, onDismiss)
+    val dismiss by rememberUpdatedState(onDismiss)
+    Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize().graphicsLayer { alpha = t }.background(Color.Black.copy(alpha = .4f))
+            .pointerInput(visible) { if (visible) detectTapGestures { dismiss() } })
+        Surface(
+            Modifier.align(Alignment.BottomCenter).fillMaxWidth()
+                .graphicsLayer { translationY = size.height * (1f - t) + drag }
+                .pointerInput(Unit) {
+                    detectVerticalDragGestures(
+                        onDragEnd = { if (drag > 64.dp.toPx()) dismiss() else drag = 0f },
+                        onDragCancel = { drag = 0f }
+                    ) { ch, dy -> ch.consume(); drag = (drag + dy).coerceAtLeast(0f) }
+                },
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Column(Modifier.navigationBarsPadding()) {
+                Box(Modifier.align(Alignment.CenterHorizontally).padding(vertical = 16.dp).size(32.dp, 4.dp)
+                    .clip(RoundedCornerShape(50)).background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .4f)))
+                content()
             }
         }
     }
@@ -470,7 +518,9 @@ private fun MusicDisc(profile: Profile, post: Post, modifier: Modifier) {
 /** Vídeo dentro de um carrossel (Instagram): toca só quando é a página visível do carrossel. */
 @Composable
 private fun SlideVideo(path: String, playing: Boolean, modifier: Modifier) {
-    val player = rememberPlayer(loop = true)               // pausa ao sair do app e é liberado ao sair da tela
+    // pausa ao sair do app e é liberado ao sair da tela; sem foco de áudio próprio, senão a música do post
+    // perdia o foco e parava de vez quando um vídeo do carrossel começava
+    val player = rememberPlayer(loop = true, audioFocus = false)
     LaunchedEffect(path) { player.setMediaItem(MediaItem.fromUri(Uri.fromFile(File(path)))); player.prepare() }
     LaunchedEffect(playing) { if (playing) player.play() else player.pause() }
     Box(Modifier.fillMaxSize()) {
@@ -484,13 +534,20 @@ private fun SlideVideo(path: String, playing: Boolean, modifier: Modifier) {
  * Ícone de pausa como no TikTok: ao pausar o "play" surge grande e encolhe até o tamanho normal com fade;
  * ao continuar ele cresce um pouco e some.
  */
-private fun PausedIcon(visible: Boolean, modifier: Modifier) {
+private fun PausedIcon(visible: Boolean, modifier: Modifier, hidden: Boolean = false) {
+    // [hidden] (zoom com pinça): some encolhendo um pouco e volta do mesmo jeito ao tirar o zoom
     AnimatedVisibility(
-        visible, modifier,
-        enter = scaleIn(tween(220, easing = FastOutSlowInEasing), initialScale = 1.6f) + fadeIn(tween(160)),
-        exit = scaleOut(tween(180), targetScale = 1.25f) + fadeOut(tween(180))
+        !hidden, modifier,
+        enter = scaleIn(tween(200, easing = FastOutSlowInEasing), initialScale = .8f) + fadeIn(tween(200)),
+        exit = scaleOut(tween(160), targetScale = .8f) + fadeOut(tween(160))
     ) {
-        Icon(Icons.Default.PlayArrow, null, Modifier.size(88.dp), tint = Color.White.copy(alpha = .8f))
+        AnimatedVisibility(
+            visible,
+            enter = scaleIn(tween(220, easing = FastOutSlowInEasing), initialScale = 1.6f) + fadeIn(tween(160)),
+            exit = scaleOut(tween(180), targetScale = 1.25f) + fadeOut(tween(180))
+        ) {
+            Icon(Icons.Default.PlayArrow, null, Modifier.size(88.dp), tint = Color.White.copy(alpha = .8f))
+        }
     }
 }
 
@@ -504,10 +561,24 @@ private const val SLIDE_MS = 3_000L
  * contador "n/N" no topo e bolinhas embaixo.
  */
 @Composable
-private fun Slides(post: Post, active: Boolean, paused: Boolean, autoAdvance: Boolean, onTap: () -> Unit) {
+private fun Slides(
+    post: Post, active: Boolean, paused: Boolean, autoAdvance: Boolean, zoomed: Boolean,
+    onSlideSound: (Boolean) -> Unit, onTap: () -> Unit
+) {
     val images = remember(post.key) { post.slideList() }
     val pager = rememberPagerState { images.size }
     fun isVideo(i: Int) = images.getOrNull(i)?.substringAfterLast('.')?.lowercase() in VIDEO_EXTS
+
+    // música do post toca em todas as fotos; num vídeo do carrossel com som próprio ela pausa
+    // e volta na próxima foto/vídeo sem som. Os vídeos são medidos antes (fica guardado).
+    LaunchedEffect(active) {
+        if (active) withContext(Dispatchers.IO) { images.filter { it.substringAfterLast('.').lowercase() in VIDEO_EXTS }.forEach { Loudness.rms(it) } }
+    }
+    val here = pager.settledPage
+    val soundHere by produceState(false, here, post.key) {
+        value = isVideo(here) && withContext(Dispatchers.IO) { Loudness.hasSound(images[here]) }
+    }
+    LaunchedEffect(active, soundHere) { if (active) onSlideSound(soundHere) }
 
     // reinicia o contador a cada troca de foto; não avança enquanto o dedo arrasta nem sobre um vídeo
     LaunchedEffect(active, paused, pager.settledPage, pager.isScrollInProgress) {
@@ -542,7 +613,7 @@ private fun Slides(post: Post, active: Boolean, paused: Boolean, autoAdvance: Bo
                 }
             }
         }
-        PausedIcon(active && paused, Modifier.align(Alignment.Center))
+        PausedIcon(active && paused, Modifier.align(Alignment.Center), hidden = zoomed)
     }
 }
 
@@ -558,6 +629,7 @@ internal fun Long.clock(): String = (this / 1000).let { "%d:%02d".format(it / 60
 @Composable
 internal fun TimelineBar(
     player: ExoPlayer, fraction: () -> Float, modifier: Modifier = Modifier,
+    extraPx: Float = 0f,                                       // px a mais na espessura da barra (feed)
     onScrub: (Float?) -> Unit
 ) {
     var dragging by remember { mutableStateOf(false) }
@@ -607,7 +679,7 @@ internal fun TimelineBar(
                 detectTapGestures { o -> val f = (o.x / size.width).coerceIn(0f, 1f); start(f); end() }
             }
             .drawBehind {
-                val h = thickness.toPx()
+                val h = thickness.toPx() + extraPx
                 val y = size.height - h / 2 - 2.dp.toPx()
                 val f = if (dragging) dragFrac else fraction()
                 drawLine(Color.White.copy(alpha = .28f), Offset(0f, y), Offset(size.width, y), h)
@@ -642,7 +714,15 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
         }
     }
     val settled = if (fingerDown) pager.settledPage else pager.targetPage
-    val pool = remember { List(3) { buildPlayer(ctx, loop = true) } }
+    // TikTok: volume normalizado entre vídeos (ganho medido por arquivo, aplicado no áudio de cada player)
+    val normalize = profile.platform == "tiktok"
+    val gains = remember { List(3) { GainProcessor() } }
+    val pool = remember { List(3) { buildPlayer(ctx, loop = true, gain = if (normalize) gains[it] else null) } }
+    val scope = rememberCoroutineScope()
+    var slideSound by remember { mutableStateOf(false) }         // foto atual do carrossel é um vídeo com som próprio
+    val slideSoundS by rememberUpdatedState(slideSound)
+    var sheetOpen by remember { mutableStateOf(false) }          // folha da música
+    var sheetPost by remember { mutableStateOf<Post?>(null) }
     val assignedKeys = remember { mutableStateListOf<String?>(null, null, null) }
     val sizes = remember { mutableStateMapOf<String, IntSize>() }
     var userPaused by remember { mutableStateOf(false) }
@@ -666,7 +746,7 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
             when (e) {
                 Lifecycle.Event.ON_PAUSE -> pool.forEach { it.pause() }
                 Lifecycle.Event.ON_RESUME ->
-                    if (!userPausedS && postsState.value.getOrNull(settledS)?.playable == true) pool[settledS % 3].play()
+                    if (!userPausedS && !slideSoundS && postsState.value.getOrNull(settledS)?.playable == true) pool[settledS % 3].play()
                 else -> {}
             }
         }
@@ -687,13 +767,22 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
                 return
             }
             if (assignedKeys[slot] != post.key) {
+                if (normalize) {
+                    val path = post.mediaPath
+                    val known = Loudness.known(path)
+                    gains[slot].gain = known?.let(Loudness::gainOf) ?: 1f
+                    if (known == null) scope.launch(Dispatchers.IO) {
+                        val g = Loudness.gainOf(Loudness.rms(path))
+                        if (assignedKeys[slot] == post.key) gains[slot].gain = g
+                    }
+                }
                 pl.setMediaItem(mediaItemOf(post))
                 pl.playWhenReady = false
                 pl.prepare()
                 assignedKeys[slot] = post.key
             }
         }
-        userPaused = false; fast = false; scrub = null
+        userPaused = false; fast = false; scrub = null; slideSound = false
         pool.forEach { it.setPlaybackSpeed(1f) }
         assign(settled)                                        // a atual primeiro: começa a tocar já
         pool.forEachIndexed { s, p -> if (s != settled % 3) p.pause() }
@@ -703,6 +792,14 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
         assign(settled + 1); assign(settled - 1)
         for (i in listOf(settled - 1, settled + 1))
             if (postsState.value.getOrNull(i)?.playable == true) pool[i % 3].apply { pause(); if (currentPosition > 0) seekTo(0) }
+    }
+
+    // carrossel: vídeo com som próprio pausa a música do post; foto ou vídeo sem som, ela continua
+    LaunchedEffect(slideSound) {
+        val post = postsState.value.getOrNull(settledS) ?: return@LaunchedEffect
+        if (!post.isSlideshow || !post.playable) return@LaunchedEffect
+        val p = pool[settledS % 3]
+        if (slideSound) p.pause() else if (!userPausedS) p.play()
     }
 
     // o perfil, ao voltar, rola até o último vídeo visto aqui
@@ -724,7 +821,8 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
 
     val onTap: () -> Unit = {
         val p = pool[settled % 3]
-        if (p.playWhenReady) { p.pause(); userPaused = true } else { p.play(); userPaused = false }
+        if (slideSound) userPaused = !userPaused            // vídeo do carrossel com som: a música fica parada
+        else if (p.playWhenReady) { p.pause(); userPaused = true } else { p.play(); userPaused = false }
     }
     val onHold: (Boolean) -> Unit = { on ->
         if (on != fast) {
@@ -784,7 +882,7 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
             // o feed só desliza (sem esticar) e deixa a faixa preta do fundo aparecer; soltou além de 110 dp, sai do vídeo
             pager, Modifier.fillMaxSize().nestedScroll(exitConnection).graphicsLayer { translationY = pull },
             beyondViewportPageCount = 1,
-            userScrollEnabled = scrub == null && !zoomedPage,
+            userScrollEnabled = scrub == null && !zoomedPage && !sheetOpen,
             flingBehavior = PagerDefaults.flingBehavior(pager, pagerSnapDistance = PagerSnapDistance.atMost(1)),
             key = { postsState.value.getOrNull(it)?.key ?: it }
         ) { page ->
@@ -794,7 +892,9 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
             val player = if (post.isVideo && near && assignedKeys[slot] == post.key) pool[slot] else null
             FeedPage(profile, post, player, sizes[post.key], page == settled, userPaused,
                 hideCaption = page == settled && scrub != null, onTap = onTap, onHold = onHold,
-                resetZoom = resetZoom, onZoom = { z -> if (z) zoomedKey = post.key else if (zoomedKey == post.key) zoomedKey = null })
+                resetZoom = resetZoom, onZoom = { z -> if (z) zoomedKey = post.key else if (zoomedKey == post.key) zoomedKey = null },
+                onMusic = { sheetPost = post; sheetOpen = true },
+                onSlideSound = { on -> if (page == settled) slideSound = on })
         }
 
         if (!zoomedPage) IconButton({ nav.popBackStack() }, Modifier.align(Alignment.TopStart).statusBarsPadding().padding(4.dp)) {
@@ -821,8 +921,12 @@ fun FeedPager(profile: Profile, posts: List<Post>, startKey: String, nav: NavCon
         if (showTimeline) TimelineBar(
             settledPlayer, { progress },
             Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 14.dp).offset { IntOffset(0, -1) },
+            extraPx = 2f,
             // ao soltar, a barra continua no ponto solto (o progresso antigo era o do keyframe)
             onScrub = { f -> if (f == null) scrub?.let { progress = it }; scrub = f }
         )
+
+        // folha da música por cima de tudo (o post fica guardado para a animação de saída)
+        FeedSheet(sheetOpen, { sheetOpen = false }) { sheetPost?.let { MusicInfo(profile, it) } }
     }
 }
