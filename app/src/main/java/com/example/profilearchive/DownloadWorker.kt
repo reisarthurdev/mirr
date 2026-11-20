@@ -117,6 +117,29 @@ private suspend fun listInstagram(ctx: Context, t: Target, onProgress: suspend (
 }
 
 /**
+ * Instagram: o feed do perfil muitas vezes vem sem a música dos posts de fotos. Pergunta post a post
+ * (media/<pk>/info) e põe "pa_music" + "slides_audio" na entrada, para a música baixar junto com as fotos.
+ * Post sem música ganha a marca .dados/<id>.semmusica e não é consultado de novo; post cuja música já
+ * está no aparelho também não. Se o Instagram limitar, para e continua na próxima verificação.
+ */
+private suspend fun addInstagramMusic(ctx: Context, dir: File, listing: List<Entry>, onProgress: suspend (String) -> Unit) {
+    val api = InstagramApi.create(ctx)
+    if (!api.loggedIn) return
+    val media = finishedFiles(dir)
+    val todo = listing.filter { e ->
+        e.isPhotoPost && e.raw.str("slides_audio") == null &&
+            media[e.id]?.extension?.lowercase() !in AUDIO_EXTS && !File(metaDir(dir), "${e.id}.semmusica").exists()
+    }
+    for ((i, e) in todo.withIndex()) {
+        onProgress("Procurando a música dos posts de fotos… ${i + 1} de ${todo.size}")
+        val found = try { api.postMusic(e.id, onProgress) } catch (x: InstagramApi.Stop) { return }
+        if (found != null) e.raw.put("pa_music", found.first).put("slides_audio", found.second)
+        else runCatching { metaDir(dir).mkdirs(); File(metaDir(dir), "${e.id}.semmusica").writeText("") }
+        delay(1_200L + kotlin.random.Random.nextLong(1_300))
+    }
+}
+
+/**
  * YouTube: a aba /videos não traz Shorts nem lives, e o link do canal sem aba devolve as abas em vez dos
  * vídeos. Lista cada aba e junta; aba que o canal não tem é ignorada (só falha se nenhuma funcionar).
  */
@@ -411,6 +434,9 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
             setProgress(workDataOf("line" to "Verificando o que já está no aparelho…"))
             val byId = listing.associateBy { it.id }
             // posts baixados antes do disco de música: completa o .info.json com a música vinda da listagem
+            if (t.platform == "instagram") try {
+                addInstagramMusic(app, dir, listing) { msg -> setProgress(workDataOf("line" to msg)) }
+            } catch (e: CancellationException) { throw e } catch (_: Exception) {}
             if (t.platform == "tiktok" || t.platform == "instagram")
                 runCatching { addMissingMusic(dir, listing.mapNotNull { e -> e.raw.optJSONObject("pa_music")?.let { e.id to it } }) }
             val onDevice = adoptRenamed(dir, byId.keys)

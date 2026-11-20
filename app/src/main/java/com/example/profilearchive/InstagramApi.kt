@@ -210,27 +210,70 @@ class InstagramApi private constructor(private val cookies: Map<String, String>)
     }
 
     /**
-     * Música do post (music_metadata da API do app): nome, artista, capa, o link do áudio e o trecho
-     * escolhido pelo autor (início e duração, em ms). Som original de vídeo não entra (já está no vídeo).
+     * Música do post: nome, artista, capa, o link do áudio e o trecho escolhido pelo autor (início e
+     * duração, em ms). Procura em music_metadata (fotos), clips_metadata (reels) e nos itens do carrossel.
+     * Música licenciada (music_info) ou, em post de fotos, áudio original de outra pessoa (original_sound_info).
+     * Som original de vídeo não entra (já está no vídeo).
      */
     private fun musicOf(item: JSONObject): Pair<JSONObject, String>? {
-        val meta = item.optJSONObject("music_metadata") ?: item.optJSONObject("clips_metadata")?.optJSONObject("music_info")?.let {
-            JSONObject().put("music_info", it)
-        } ?: return null
-        val asset = meta.optJSONObject("music_info")?.optJSONObject("music_asset_info") ?: return null
-        val url = asset.optString("progressive_download_url").ifBlank { asset.optString("fast_start_progressive_download_url") }
-            .takeIf { it.startsWith("http") } ?: return null
-        val start = findLong(meta, "audio_asset_start_time_in_ms")
-            ?: asset.optJSONArray("highlight_start_times_in_ms")?.optLong(0)
-        val length = findLong(meta, "overlap_duration_in_ms")
-        val song = JSONObject().apply {
-            putOpt("title", asset.optString("title").ifBlank { null })
-            putOpt("author", asset.optString("display_artist").ifBlank { null })
-            putOpt("cover", asset.optString("cover_artwork_uri").ifBlank { asset.optString("cover_artwork_thumbnail_uri") }.ifBlank { null })
-            put("original", false)
-            putOpt("start_ms", start); putOpt("length_ms", length?.takeIf { it > 0 })
+        val isVideo = item.optInt("media_type") == 2
+        val metas = buildList {
+            item.optJSONObject("music_metadata")?.let(::add)
+            item.optJSONObject("clips_metadata")?.let(::add)
+            item.optJSONArray("carousel_media").objects().forEach { c -> c.optJSONObject("music_metadata")?.let(::add) }
         }
-        return song to url
+        fun http(o: JSONObject?, k: String) = o?.str(k)?.takeIf { it.startsWith("http") }
+        for (meta in metas) {
+            val info = meta.optJSONObject("music_info")
+            val asset = info?.optJSONObject("music_asset_info")
+            val use = info?.optJSONObject("music_consumption_info")
+            if (asset != null) {
+                if (use?.optBoolean("should_mute_audio") == true) return null
+                val full = http(asset, "progressive_download_url") ?: http(asset, "fast_start_progressive_download_url")
+                // prévia de 30 s: já é o trecho, então não leva início/duração (cortaria fora do arquivo)
+                val url = full ?: http(asset, "web_30s_preview_download_url") ?: continue
+                val start = if (full == null) null else use?.longOrNull("audio_asset_start_time_in_ms")
+                    ?: findLong(meta, "audio_asset_start_time_in_ms") ?: asset.optJSONArray("highlight_start_times_in_ms")?.optLong(0)
+                val length = if (full == null) null else use?.longOrNull("overlap_duration_in_ms") ?: findLong(meta, "overlap_duration_in_ms")
+                return JSONObject().apply {
+                    putOpt("title", asset.str("title")); putOpt("author", asset.str("display_artist"))
+                    putOpt("cover", asset.str("cover_artwork_uri") ?: asset.str("cover_artwork_thumbnail_uri"))
+                    put("original", false)
+                    putOpt("start_ms", start); putOpt("length_ms", length?.takeIf { it > 0 })
+                } to url
+            }
+            val orig = meta.optJSONObject("original_sound_info")
+            if (!isVideo && orig != null) {
+                val url = http(orig, "progressive_download_url") ?: continue
+                return JSONObject().apply {
+                    put("title", orig.str("original_audio_title") ?: "Áudio original")
+                    putOpt("author", orig.optJSONObject("ig_artist")?.str("username"))
+                    putOpt("cover", orig.optJSONObject("ig_artist")?.str("profile_pic_url"))
+                    put("original", true)
+                    putOpt("start_ms", orig.longOrNull("audio_asset_start_time_in_ms"))
+                    putOpt("length_ms", (orig.longOrNull("overlap_duration_in_ms") ?: orig.longOrNull("duration_in_ms"))?.takeIf { it > 0 })
+                } to url
+            }
+        }
+        return null
+    }
+
+    /**
+     * Música de um post de fotos pela media/<pk>/info: o feed do perfil muitas vezes não traz a música
+     * de posts de fotos, essa rota traz. Só com login. null = o post não tem música.
+     */
+    suspend fun postMusic(code: String, onWait: suspend (String) -> Unit): Pair<JSONObject, String>? {
+        val item = json("https://i.instagram.com/api/v1/media/${pkOf(code)}/info/", app = true, onWait)
+            .optJSONArray("items")?.optJSONObject(0) ?: return null
+        return if (item.optInt("media_type") == 2) null else musicOf(item)
+    }
+
+    /** Id numérico do post a partir do código do link (base64 do Instagram, só os 11 primeiros caracteres). */
+    private fun pkOf(code: String): String {
+        val abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        var n = java.math.BigInteger.ZERO
+        code.take(11).forEach { ch -> n = n.shiftLeft(6).add(java.math.BigInteger.valueOf(abc.indexOf(ch).coerceAtLeast(0).toLong())) }
+        return n.toString()
     }
 
     private fun slideFromNode(n: JSONObject): JSONObject? {
