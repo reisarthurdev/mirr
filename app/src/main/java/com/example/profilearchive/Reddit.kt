@@ -33,22 +33,49 @@ object Reddit {
 
     // ───────── HTTP com respeito ao limite do Reddit ─────────
 
+    /** User-Agent no formato que a API do Reddit pede; UA de navegador sem navegador costuma levar 403. */
+    private const val APP_UA = "android:com.example.profilearchive:v2.0 (archive app)"
+
+    /**
+     * token_v2 dos cookies: é o token que o próprio site usa para chamar oauth.reddit.com.
+     * É um JWT; vencido (campo exp) não serve.
+     */
+    private fun bearer(cookies: List<CookieStore.Cookie>): String? {
+        val t = cookies.firstOrNull { it.name == "token_v2" }?.value?.takeIf { it.isNotBlank() } ?: return null
+        val exp = runCatching {
+            JSONObject(String(android.util.Base64.decode(t.split('.')[1], android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP)))
+                .optLong("exp", 0)
+        }.getOrDefault(0)
+        return t.takeIf { exp == 0L || exp * 1000 > System.currentTimeMillis() + 60_000 }
+    }
+
     /**
      * GET de JSON. O Reddit informa quantas consultas restam (x-ratelimit-remaining) e quando o limite
      * zera (x-ratelimit-reset, em segundos): acabando, espera em vez de levar 429.
-     * Bloqueio em www (403) tenta o old.reddit, que costuma ser mais tolerante.
+     * Ordem das tentativas: oauth.reddit.com com o token_v2 dos cookies (rota do site logado, a que o
+     * Reddit não bloqueia), depois www e old.reddit com os cookies e um User-Agent de app, e por
+     * último os mesmos com User-Agent de navegador.
      */
     private fun get(ctx: Context, pathAndQuery: String, onWait: (String) -> Unit): Any {
-        val cookie = CookieStore.cookiesOf(ctx, "reddit").joinToString("; ") { "${it.name}=${it.value}" }
+        val cookies = CookieStore.cookiesOf(ctx, "reddit")
+        val cookie = cookies.joinToString("; ") { "${it.name}=${it.value}" }
+        val token = bearer(cookies)
+        data class Try(val host: String, val ua: String, val auth: Boolean)
+        val tries = buildList {
+            if (token != null) { add(Try("https://oauth.reddit.com", APP_UA, true)); add(Try("https://oauth.reddit.com", APP_UA, true)) }
+            add(Try("https://www.reddit.com", APP_UA, false)); add(Try("https://old.reddit.com", APP_UA, false))
+            add(Try("https://www.reddit.com", UA, false)); add(Try("https://old.reddit.com", UA, false))
+        }
         var lastStatus = 0
-        for (attempt in 0..3) {
-            val host = if (attempt % 2 == 0) "https://www.reddit.com" else "https://old.reddit.com"
-            val c = URL("$host/$pathAndQuery").openConnection() as HttpURLConnection
+        for (t in tries) {
+            val c = URL("${t.host}/$pathAndQuery").openConnection() as HttpURLConnection
             try {
                 c.connectTimeout = 15_000; c.readTimeout = 30_000
-                c.setRequestProperty("User-Agent", UA)
+                c.instanceFollowRedirects = true
+                c.setRequestProperty("User-Agent", t.ua)
                 c.setRequestProperty("Accept", "application/json")
-                if (cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
+                if (t.auth) c.setRequestProperty("Authorization", "Bearer $token")
+                else if (cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
                 lastStatus = c.responseCode
                 val remaining = c.getHeaderField("x-ratelimit-remaining")?.toDoubleOrNull()
                 val reset = c.getHeaderField("x-ratelimit-reset")?.toLongOrNull() ?: 60
@@ -56,23 +83,30 @@ object Reddit {
                     200 -> {
                         val body = c.inputStream.bufferedReader().use { it.readText() }
                         if (remaining != null && remaining < 2) { onWait("Limite do Reddit, continuando em ${reset + 1} s…"); Thread.sleep((reset + 1) * 1000) }
-                        val t = body.trimStart()
-                        return when {
-                            t.startsWith("[") -> JSONArray(t)
-                            t.startsWith("{") -> JSONObject(t)
-                            else -> throw Failed("O Reddit devolveu uma página em vez dos dados (bloqueio). Cole os cookies do Reddit nas Configurações")
+                        val s = body.trimStart()
+                        when {
+                            s.startsWith("[") -> return JSONArray(s)
+                            s.startsWith("{") -> return JSONObject(s)
+                            else -> {}                              // página de bloqueio: tenta a próxima rota
                         }
                     }
-                    429 -> { onWait("O Reddit pediu uma pausa, continuando em ${reset + 1} s…"); Thread.sleep((reset + 1) * 1000) }
-                    403 -> if (attempt >= 1) break
+                    429 -> { onWait("O Reddit pediu uma pausa, continuando em ${reset.coerceAtMost(120) + 1} s…"); Thread.sleep((reset.coerceAtMost(120) + 1) * 1000) }
                     404 -> throw Failed("Não encontrado no Reddit (o nome está certo?)")
-                    else -> if (attempt >= 1) break
+                    else -> {}                                      // 401/403/5xx: próxima rota
                 }
+            } catch (e: java.io.IOException) {
+                lastStatus = -1
             } finally { c.disconnect() }
         }
-        throw Failed(when (lastStatus) {
-            403 -> "O Reddit recusou o acesso (perfil privado, banido ou bloqueio de rede). Cole os cookies do Reddit nas Configurações"
-            429 -> "O Reddit limitou as consultas. Tente de novo em alguns minutos"
+        val hasLogin = cookies.any { it.name == "reddit_session" || it.name == "token_v2" }
+        throw Failed(when {
+            lastStatus == 403 && token == null && hasLogin ->
+                "O Reddit recusou o acesso. Os cookies colados não têm um \"token_v2\" válido (ele vence em ~1 dia): abra o reddit.com logado no navegador e cole os cookies de novo"
+            lastStatus == 403 && hasLogin ->
+                "O Reddit recusou o acesso mesmo com os cookies (subreddit privado/banido, ou a sessão expirou: cole os cookies de novo)"
+            lastStatus == 403 -> "O Reddit recusou o acesso (perfil privado, banido ou bloqueio de rede). Cole os cookies do Reddit nas Configurações"
+            lastStatus == 429 -> "O Reddit limitou as consultas. Tente de novo em alguns minutos"
+            lastStatus == -1 -> "Sem conexão com o Reddit"
             else -> "O Reddit respondeu HTTP $lastStatus"
         })
     }

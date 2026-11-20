@@ -2,6 +2,8 @@
 
 package com.example.profilearchive
 
+import kotlinx.coroutines.coroutineScope
+
 import android.net.Uri
 import androidx.compose.ui.res.painterResource
 import androidx.compose.animation.core.animate
@@ -289,6 +291,8 @@ private fun rememberOverscrollFiller(list: LazyListState, spacing: Dp): Dp {
 private object HomeScroll {
     val seen = HashSet<java.util.UUID>()
     var ready = false
+    val seenFailed = HashSet<java.util.UUID>()
+    var readyFailed = false
 }
 
 @Composable
@@ -328,14 +332,22 @@ fun HomeScreen(nav: NavController, openMenu: () -> Unit) {
         // download novo (perfil adicionado ou reverificado): volta a lista ao topo e abre o título de novo.
         // Os ids já vistos ficam fora da tela (HomeScroll): voltar para a tela inicial não conta como novo.
         val active = works.filter { it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED }.map { it.id }
+        suspend fun toTop() = coroutineScope {
+            launch { list.animateScrollToItem(0) }
+            animate(scroll.state.heightOffset, 0f) { v, _ -> scroll.state.heightOffset = v }
+            scroll.state.contentOffset = 0f
+        }
         LaunchedEffect(active) {
             val fresh = active.filter { HomeScroll.seen.add(it) }
-            if (fresh.isNotEmpty() && HomeScroll.ready) {
-                launch { list.animateScrollToItem(0) }
-                animate(scroll.state.heightOffset, 0f) { v, _ -> scroll.state.heightOffset = v }
-                scroll.state.contentOffset = 0f
-            }
+            if (fresh.isNotEmpty() && HomeScroll.ready) toTop()
             HomeScroll.ready = true      // a 1ª leitura (abrindo o app) só registra o que já estava rodando
+        }
+        // erro novo: sobe do mesmo jeito, para o aviso vermelho (que fica no topo) aparecer
+        val failedIds = failed.map { it.id }
+        LaunchedEffect(failedIds) {
+            val fresh = failedIds.filter { HomeScroll.seenFailed.add(it) }
+            if (fresh.isNotEmpty() && HomeScroll.readyFailed) toTop()
+            HomeScroll.readyFailed = true
         }
         LazyColumn(
             Modifier.padding(pad).fillMaxSize(), state = list,
