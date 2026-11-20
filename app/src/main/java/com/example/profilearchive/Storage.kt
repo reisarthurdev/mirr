@@ -190,17 +190,14 @@ suspend fun backfillSizes(dao: AppDao, pid: Long, dir: File) {
 
 // ───────────── perfis que já estão na pasta ─────────────
 
-private val FOLDER_PLATFORM = mapOf("YouTube" to "youtube", "TikTok" to "tiktok", "Instagram" to "instagram", "X" to "x", "Reddit" to "reddit")
+private val FOLDER_PLATFORM = mapOf("YouTube" to "youtube", "TikTok" to "tiktok", "Instagram" to "instagram")
 
 /** Link do perfil no mesmo formato que parseProfileUrl gera (é a chave do download no WorkManager). */
 fun profileUrl(platform: String, username: String) = when (platform) {
     "youtube" -> if (username.startsWith("UC") && username.length == 24) "https://www.youtube.com/channel/$username/videos"
         else "https://www.youtube.com/@$username/videos"
     "tiktok" -> "https://www.tiktok.com/@$username"
-    "instagram" -> "https://www.instagram.com/$username/"
-    "reddit" -> if (Reddit.isSubreddit(username)) "https://www.reddit.com/r/${Reddit.nameOf(username)}/"
-        else "https://www.reddit.com/user/${Reddit.nameOf(username)}/"
-    else -> "https://x.com/$username"
+    else -> "https://www.instagram.com/$username/"
 }
 
 /**
@@ -224,11 +221,10 @@ private fun readProfileInfo(dir: File, platform: String): Triple<String?, String
     }
     val info = metaDir(dir).listFiles().orEmpty().asSequence().filter { it.name.endsWith(".info.json") }.take(5)
         .mapNotNull { runCatching { JSONObject(it.readText()) }.getOrNull() }
-    // TikTok e YouTube: "channel" é o nome de exibição; Instagram/Reddit: pa_name do plugin; X: uploader
+    // TikTok e YouTube: "channel" é o nome de exibição; Instagram: pa_name do plugin
     val name = info.firstNotNullOfOrNull { j ->
         when (platform) {
-            "instagram", "reddit" -> j.str("pa_name")
-            "x" -> j.str("uploader")
+            "instagram" -> j.str("pa_name")
             else -> j.str("channel")
         }
     }

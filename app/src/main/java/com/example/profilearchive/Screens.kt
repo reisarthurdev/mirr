@@ -159,11 +159,10 @@ fun thumbOf(p: Post): File? =
 /** "@usuario"; canal do YouTube salvo pelo id (UC…) mostra o nome do canal no lugar do id ilegível. */
 fun Profile.handle(): String = when {
     platform == "youtube" && username.startsWith("UC") && username.length == 24 -> displayName
-    platform == "reddit" -> Reddit.handle(username)
     else -> "@$username"
 }
 
-fun platformLabel(p: String) = when (p) { "youtube" -> "YouTube"; "tiktok" -> "TikTok"; "instagram" -> "Instagram"; "reddit" -> "Reddit"; else -> "X" }
+fun platformLabel(p: String) = when (p) { "youtube" -> "YouTube"; "tiktok" -> "TikTok"; else -> "Instagram" }
 fun Long.date(): String = SimpleDateFormat("dd/MM/yyyy", Locale.getDefault()).format(Date(this))
 fun Long.compact(): String = when {
     this >= 1_000_000 -> "%.1fM".format(this / 1e6)
@@ -570,7 +569,7 @@ fun ProfileScreen(id: Long, nav: NavController, saved: SavedStateHandle) {
     Scaffold(
         modifier = Modifier.swipeToBack { nav.popBackStack() },
         topBar = {
-            TopAppBar(
+            AppTopBar(
                 // Instagram: usuário sem "@" e em negrito, como no app
                 title = {
                     if (p?.platform == "instagram") Text(p.username, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -602,11 +601,6 @@ fun ProfileScreen(id: Long, nav: NavController, saved: SavedStateHandle) {
                 if (work != null) item { WorkProgress(work, Modifier.padding(16.dp, 0.dp)) }
                 item { Header(p) }
                 items(posts, key = { it.key }) { VideoRow(it, open, long) }
-            }
-            "x" -> LazyColumn(Modifier.padding(pad)) {
-                if (work != null) item { WorkProgress(work, Modifier.padding(16.dp, 0.dp)) }
-                item { Header(p) }
-                items(posts, key = { it.key }) { TweetCard(p, it, open, long) }
             }
             else -> LazyVerticalGrid(
                 GridCells.Fixed(3), Modifier.padding(pad), state = grid,
@@ -700,7 +694,7 @@ fun Header(p: Profile) {
             }
             if (p.bio.isNotBlank()) Text(p.bio, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
         }
-        else -> Column(Modifier.fillMaxWidth().padding(16.dp)) {   // YouTube e X
+        else -> Column(Modifier.fillMaxWidth().padding(16.dp)) {   // YouTube
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Avatar(p.avatarPath, 80); Spacer(Modifier.width(16.dp))
                 Column {
@@ -743,24 +737,6 @@ fun VideoRow(post: Post, open: (Post) -> Unit, long: (Post) -> Unit) {
     }
 }
 
-@Composable
-fun TweetCard(p: Profile, post: Post, open: (Post) -> Unit, long: (Post) -> Unit) {
-    Column {
-        Row(Modifier.fillMaxWidth().combinedClickable(onLongClick = { long(post) }, onClick = { open(post) }).padding(12.dp)) {
-            Avatar(p.avatarPath, 44); Spacer(Modifier.width(10.dp))
-            Column {
-                Text("${p.displayName}  @${p.username} · ${post.timestamp.date()}", style = MaterialTheme.typography.bodySmall)
-                if (post.description.isNotBlank()) Text(post.description, modifier = Modifier.padding(vertical = 4.dp))
-                thumbOf(post)?.let {
-                    AsyncImage(it, null, Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(14.dp)), contentScale = ContentScale.Crop)
-                }
-                Text("♥ ${post.likes?.compact() ?: 0}", style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
-            }
-        }
-        HorizontalDivider()
-    }
-}
-
 // ───────────────────────── Adicionar perfil ─────────────────────────
 
 @Composable
@@ -773,12 +749,12 @@ fun AddScreen(nav: NavController, openMenu: () -> Unit) {
     val keyboard = LocalSoftwareKeyboardController.current
     LaunchedEffect(Unit) { withFrameNanos { }; focus.requestFocus(); keyboard?.show() }
     Scaffold(topBar = {
-        TopAppBar(title = { Text("Adicionar perfil") },
+        AppTopBar(title = { Text("Adicionar perfil") },
             navigationIcon = { IconButton(openMenu) { Icon(Icons.Default.Menu, "Menu") } })
     }) { pad ->
         Column(Modifier.padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth().focusRequester(focus), singleLine = true,
-                label = { Text("Link do perfil (YouTube, TikTok, Instagram, X ou Reddit)") },
+                label = { Text("Link do perfil (YouTube, TikTok ou Instagram)") },
                 supportingText = {
                     Text(target?.let { "Detectado: ${it.label} · @${it.username}" + if (it.seed != null) " (pelo vídeo)" else "" }
                         ?: if (url.isBlank()) "Ex.: https://www.tiktok.com/@usuario" else "Link não reconhecido")
@@ -833,7 +809,7 @@ fun SettingsScreen(nav: NavController) {
         modifier = Modifier.swipeToBack { nav.popBackStack() },
         snackbarHost = { SnackbarHost(snack) },
         topBar = {
-            TopAppBar(title = { Text("Configurações") },
+            AppTopBar(title = { Text("Configurações") },
                 navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar") } })
         }
     ) { pad ->

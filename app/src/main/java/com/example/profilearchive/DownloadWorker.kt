@@ -222,8 +222,8 @@ private fun runBatch(
         addOption("--concurrent-fragments", "4"); addOption("--http-chunk-size", "10M")
         addOption("--retries", "5"); addOption("--fragment-retries", "5")
         addOption("--extractor-retries", "3"); addOption("--socket-timeout", "30")
-        // Instagram e X limitam rápido (429): pausa entre requisições e entre posts
-        if (t.platform == "instagram" || t.platform == "x" || t.platform == "reddit") {
+        // Instagram limita rápido (429): pausa entre requisições e entre posts
+        if (t.platform == "instagram") {
             addOption("--sleep-requests", "1.5"); addOption("--sleep-interval", "2"); addOption("--max-sleep-interval", "5")
         }
     }.withCookies(cookies, procId)
@@ -298,7 +298,7 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
             if (it != null) procIds.forEach { p -> runCatching { YoutubeDL.getInstance().destroyProcessById(p) } }
         }
         fun proc(name: String) = "$procBase-$name".also { procIds += it }
-        val title = if (t.platform == "reddit") Reddit.handle(t.username) else "@${t.username}"
+        val title = "@${t.username}"
         try {
             runCatching { setForeground(fgInfo(title, "Preparando…", null)) }   // sem notificação não pode impedir o download
             setProgress(workDataOf("line" to "Iniciando…"))
@@ -347,8 +347,7 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
             var metaJson: JSONObject? = null
             // Instagram: pula (o plugin manda os dados do perfil em cada post da listagem). Cada consulta
             // a mais conta para o limite do Instagram, e consultas seguidas dão erro 429.
-            // Reddit também pula: o yt-dlp não lê perfis do Reddit; os dados vêm junto da listagem
-            for (a in 1..(if (t.platform == "instagram" || t.platform == "reddit") 0 else 2)) {
+            for (a in 1..(if (t.platform == "instagram") 0 else 2)) {
                 if (metaJson != null) break
                 runCatching {
                     val pm = proc("meta$a")
@@ -388,14 +387,10 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
                         "instagram" -> listInstagram(app, t) { msg -> setProgress(workDataOf("line" to msg)) }
                             ?: listProfile(listUrl(), t, cookies, proc("list$attempt"))   // WebView indisponível: plugin do yt-dlp
                         "youtube" -> listYouTube(t, cookies) { tab -> proc("list$attempt-$tab") }
-                        "reddit" -> Reddit.list(app, t.username) { msg -> setProgressAsync(workDataOf("line" to msg)) }
-                            .map { Entry(it.getString("id"), it.getString("url"), it) }
                         else -> listProfile(listUrl(), t, cookies, proc("list$attempt"))
                     }
                 } catch (e: InstagramApi.Stop) {
                     listErr = e.message; break
-                } catch (e: Reddit.Failed) {
-                    listErr = e.message; break                  // resposta definitiva do Reddit (já esperou o limite dentro)                  // já esperou dentro (ou é definitivo); insistir só piora o bloqueio
                 } catch (e: Exception) { if (e is CancellationException) throw e; listErr = errLine(e) }
                 if (listing.isNotEmpty()) break
                 // 429 = o site pediu para esperar: tentar de novo em 2 s só piora; espera de verdade
@@ -411,7 +406,7 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
                 else ""
                 return@withContext fail(
                     "Não foi possível listar o conteúdo (${listErr ?: "nenhum item encontrado"}).\n\n$secIdHint" +
-                        "Instagram/X/TikTok normalmente exigem login: cole seus cookies nas Configurações. Tente novamente em instantes."
+                        "Instagram e TikTok normalmente exigem login: cole seus cookies nas Configurações. Tente novamente em instantes."
                 )
             }
             // bio/seguidores que o passo 1 não trouxe: pega do 1º post da listagem
@@ -465,7 +460,7 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
             }
 
             if (missingIds.isNotEmpty()) {
-                val par = (if (t.platform == "instagram" || t.platform == "x" || t.platform == "reddit") minOf(prefs.parallel, 2) else prefs.parallel).coerceIn(1, MAX_PARALLEL)
+                val par = (if (t.platform == "instagram") minOf(prefs.parallel, 2) else prefs.parallel).coerceIn(1, MAX_PARALLEL)
                 val photoGate = Semaphore(MAX_PARALLEL)
 
                 /** Posts de fotos: o app baixa direto (tudo ou nada). */
@@ -510,13 +505,9 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
                     }
                     // a) posts de fotos identificados na listagem
                     downloadPhotos(stillMissing().filter { it.isPhotoPost }.map { it.id to it.raw })
-                    // Reddit: links do vídeo e do áudio vêm do manifesto DASH do v.redd.it (o yt-dlp abriria a
-                    // página do post, que o Reddit bloqueia)
-                    if (t.platform == "reddit") stillMissing().filter { !it.isPhotoPost && !it.hasDirectLinks && it.raw.str("pa_dash") != null }
-                        .forEach { e -> ensureActive(); Reddit.videoFormats(e.raw.str("pa_dash")!!)?.let { e.raw.put("pa_formats", it) } }
-                    // b) TikTok, Instagram e Reddit: vídeos com links já na listagem baixam direto, sem abrir uma
+                    // b) TikTok e Instagram: vídeos com links já na listagem baixam direto, sem abrir uma
                     //    página por vídeo (mais rápido e, no Instagram, é o que evita o bloqueio 429)
-                    if (t.platform == "tiktok" || t.platform == "instagram" || t.platform == "reddit")
+                    if (t.platform == "tiktok" || t.platform == "instagram")
                         parallelDownload(stillMissing().filter { !it.isPhotoPost && it.hasDirectLinks }, direct = true, round = 0)
                     // c) o resto (e o que falhou acima) pelo caminho normal, com novas tentativas
                     // (Instagram: 1 rodada só; cada página de post conta para o limite de consultas)
@@ -527,7 +518,7 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
                         parallelDownload(rest, direct = false, round = round)
                     }
                     // d) outros sites: o que o caminho normal não conseguiu (ex.: Instagram pedindo login) tenta pelos links da listagem
-                    if (t.platform != "tiktok" && t.platform != "instagram" && t.platform != "reddit")
+                    if (t.platform != "tiktok" && t.platform != "instagram")
                         parallelDownload(stillMissing().filter { !it.isPhotoPost && it.hasDirectLinks }, direct = true, round = 9)
                     // d) TikTok: o que veio sem vídeo ou só com a música é post de fotos. Rebaixa os metadados
                     //    (o plugin acrescenta as fotos) e baixa as fotos + música juntas
@@ -579,18 +570,6 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
             }
             // capas das músicas (disco no player); falha aqui não afeta o download
             if (t.platform == "tiktok") runCatching { downloadMusicCovers(dir) }
-            // Reddit: comentários dos posts que estão no aparelho (falha não derruba o download)
-            if (t.platform == "reddit") {
-                indexNow()
-                val have = completedIds(dir) + completedSlideIds(dir)
-                runCatching {
-                    Reddit.fetchComments(app, dir, listing.filter { it.id in have }.map { it.id to (it.raw.longOrNull("timestamp") ?: 0L) }) { msg ->
-                        setProgressAsync(workDataOf("line" to msg))
-                        runCatching { setForegroundAsync(fgInfo(title, msg, null)) }
-                    }
-                }
-            }
-
             // 4) finaliza
             indexNow()
             backfillSizes(dao, pid, dir)

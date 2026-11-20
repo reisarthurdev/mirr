@@ -84,3 +84,20 @@ fun ShrinkingTopBar(title: String, scroll: TopAppBarScrollBehavior, navigationIc
         )
     }
 }
+
+/**
+ * TopAppBar do Material que troca de cor junto com o resto do app. O original anima a cor do fundo
+ * sozinho (mola de ~0,5 s) e, ao trocar o tema, terminava depois do fade da troca. Recriado a cada
+ * esquema de cores, ele já nasce com a cor nova.
+ */
+@Composable
+fun AppTopBar(
+    title: @Composable () -> Unit,
+    navigationIcon: @Composable () -> Unit = {},
+    actions: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit = {}
+) {
+    val c = MaterialTheme.colorScheme
+    androidx.compose.runtime.key(c.surface, c.surfaceContainer, c.onSurface) {
+        androidx.compose.material3.TopAppBar(title = title, navigationIcon = navigationIcon, actions = actions)
+    }
+}

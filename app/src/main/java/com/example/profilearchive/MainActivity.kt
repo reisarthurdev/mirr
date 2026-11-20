@@ -15,6 +15,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.tween
@@ -64,6 +66,13 @@ class MainActivity : ComponentActivity() {
         prefs.migrateLegacyDir()
         // miniatura de vídeo sem capa: o Coil extrai um quadro do próprio arquivo
         Coil.setImageLoader(ImageLoader.Builder(this).components { add(VideoFrameDecoder.Factory()) }.build())
+        // Reddit e X saíram do app: os perfis deles somem da lista (os arquivos na pasta ficam)
+        lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                val dao = Db.get(this@MainActivity).dao()
+                dao.unsupportedIds().forEach { id -> dao.deletePosts(id); dao.deleteRow(id) }
+            }
+        }
         ThemeState.mode = prefs.themeMode
         ThemeState.dynamic = prefs.dynamic
 

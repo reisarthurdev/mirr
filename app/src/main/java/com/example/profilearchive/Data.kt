@@ -29,7 +29,7 @@ import java.io.File
 @Entity(tableName = "profiles")
 data class Profile(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val platform: String,          // youtube | tiktok | instagram | x
+    val platform: String,          // youtube | tiktok | instagram
     val username: String,
     val url: String,
     val displayName: String,
@@ -96,6 +96,8 @@ abstract class AppDao {
     @Query("DELETE FROM posts WHERE profileId = :id") abstract suspend fun deletePosts(id: Long)
     @Query("DELETE FROM posts WHERE `key` = :k") abstract suspend fun deletePost(k: String)
     @Query("DELETE FROM profiles WHERE id = :id") abstract suspend fun deleteRow(id: Long)
+    /** Perfis de sites que o app não suporta mais (Reddit e X). */
+    @Query("SELECT id FROM profiles WHERE platform IN ('x', 'reddit')") abstract suspend fun unsupportedIds(): List<Long>
     @Query("UPDATE profiles SET postCount = (SELECT COUNT(*) FROM posts WHERE profileId = :id) WHERE id = :id") abstract suspend fun recount(id: Long)
     @Query("UPDATE profiles SET synced = :s WHERE id = :id") abstract suspend fun setSynced(id: Long, s: Boolean)
     @Query("UPDATE profiles SET failedCount = 0, failInfo = NULL WHERE id = :id") abstract suspend fun clearFailures(id: Long)
@@ -296,18 +298,6 @@ fun parseProfileUrl(raw: String): Target? {
         }
         host == "instagram.com" && first !in setOf("p", "reel", "reels", "stories", "explore") ->
             Target("instagram", "Instagram", first, "https://www.instagram.com/$first/")
-        // Reddit: usuário (/user/nome, /u/nome) ou subreddit (/r/nome). Vira "u_nome" / "r_nome".
-        host == "reddit.com" || host.endsWith(".reddit.com") -> {
-            val name = seg.getOrNull(1)?.takeIf { it.isNotBlank() } ?: return null
-            when (first.lowercase()) {
-                "user", "u" -> Target("reddit", "Reddit", "u_$name", "https://www.reddit.com/user/$name/")
-                "r" -> Target("reddit", "Reddit", "r_$name", "https://www.reddit.com/r/$name/")
-                else -> null
-            }
-        }
-        host == "twitter.com" || host == "x.com" ->
-            if (first in setOf("i", "home", "explore", "search")) null
-            else Target("x", "X", first, "https://x.com/$first")
         else -> null
     }
 }
@@ -357,13 +347,6 @@ fun loadMeta(profile: Profile, post: Post): List<Pair<String, String>> {
     fun add(k: String, v: String?) { if (!v.isNullOrBlank()) out += k to v }
     fun num(k: String): Long? = j?.let { if (it.has(k) && !it.isNull(k)) it.optLong(k) else null }
     add("Perfil", "${profile.handle()} · ${platformLabel(profile.platform)}")
-    if (profile.platform == "reddit") {
-        j?.optString("uploader")?.takeIf { it.isNotBlank() }?.let { add("Autor", "u/$it") }
-        j?.optString("channel")?.takeIf { it.startsWith("r/") }?.let { add("Subreddit", it) }
-        Reddit.readComments(File(post.mediaPath).parentFile!!, id)?.let { (n, list) ->
-            add("Comentários salvos", "%,d de %,d".format(list.count { it.more == 0 }, n))
-        }
-    }
     add("Descrição", post.description.ifBlank { "[sem descrição]" })
     add("Publicado em", java.text.SimpleDateFormat("dd/MM/yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(post.timestamp)))
     post.likes?.let { add("Curtidas", "%,d".format(it)) }

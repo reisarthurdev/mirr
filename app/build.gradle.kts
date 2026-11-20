@@ -61,7 +61,6 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.webkit:webkit:1.11.0")      // WebView sem o cabeçalho X-Requested-With (Reddit)
     implementation("androidx.navigation:navigation-compose:2.8.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
     // instala os baseline profiles do Compose/Media3 no APK instalado fora da Play Store (menos jank no início)

@@ -182,14 +182,14 @@ fun PostScreen(key: String, nav: NavController) {
     if (prof == null || list == null) { Box(Modifier.fillMaxSize().background(Color.Black)); return }
 
     when (prof.platform) {
-        "tiktok", "instagram", "reddit" -> {
+        "tiktok", "instagram" -> {
             LaunchedEffect(list.isEmpty()) { if (list.isEmpty()) nav.popBackStack() }
             if (list.isNotEmpty()) FeedPager(prof, list, key, nav, delete)
         }
         else -> {
             LaunchedEffect(post) { if (post != null) seen = true else if (seen) nav.popBackStack() }
             val p = post ?: return
-            if (prof.platform == "youtube") YouTubeWatch(prof, p, nav, delete) else TweetDetail(prof, p, nav, delete)
+            if (prof.platform == "youtube") YouTubeWatch(prof, p, nav, delete) else LaunchedEffect(Unit) { nav.popBackStack() }
         }
     }
 }
@@ -269,39 +269,6 @@ fun YouTubeWatch(profile: Profile, post: Post, nav: NavController, onDelete: (Po
                     Text(post.description, Modifier.padding(12.dp), maxLines = if (expanded) Int.MAX_VALUE else 3, overflow = TextOverflow.Ellipsis)
                 }
             }
-        }
-    }
-}
-
-// ───────────────────────── X ─────────────────────────
-
-@Composable
-fun TweetDetail(profile: Profile, post: Post, nav: NavController, onDelete: (Post) -> Unit) {
-    val player = rememberPlayer(loop = true)
-    LaunchedEffect(post.mediaPath) { if (post.isVideo) player.load(post.mediaPath) }
-    Scaffold(
-        modifier = Modifier.swipeToBack { nav.popBackStack() },
-        topBar = {
-            TopAppBar(title = { Text("Post") },
-                navigationIcon = { IconButton({ nav.popBackStack() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Voltar") } },
-                actions = { PostMenu(profile, post, MaterialTheme.colorScheme.onSurface, onDelete = onDelete) })
-        }
-    ) { pad ->
-        Column(Modifier.padding(pad).verticalScroll(rememberScrollState()).padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Avatar(profile.avatarPath, 48); Spacer(Modifier.width(12.dp))
-                Column {
-                    Text(profile.displayName, fontWeight = FontWeight.Bold)
-                    Text("@${profile.username}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-            if (post.description.isNotBlank()) Text(post.description, fontSize = 20.sp, modifier = Modifier.padding(vertical = 12.dp))
-            if (post.isVideo) Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(16.dp)).background(Color.Black)) {
-                AndroidView({ c -> inflatePlayer(c, false) }, Modifier.fillMaxSize(), update = { it.player = player })
-                VideoControls(player, fullscreen = false, onFullscreen = null, onMinimize = null, drag = null)
-            } else AsyncImage(File(post.mediaPath), null, Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)), contentScale = ContentScale.FillWidth)
-            Text(post.timestamp.date(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 12.dp))
         }
     }
 }

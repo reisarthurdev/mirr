@@ -144,7 +144,6 @@ private fun FeedPage(
     onMusic: () -> Unit = {}, onSlideSound: (Boolean) -> Unit = {}
 ) {
     val isTikTok = profile.platform == "tiktok"
-    val isReddit = profile.platform == "reddit"
     val tap by rememberUpdatedState(onTap)     // os lambdas mudam quando a página assentada muda
     val hold by rememberUpdatedState(onHold)
     var expanded by remember(post.key) { mutableStateOf(false) }
@@ -217,20 +216,13 @@ private fun FeedPage(
         // disco da música (TikTok): toque abre o nome e o autor
         if (isTikTok && !uiHidden) MusicDisc(profile, post,
             Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 12.dp, bottom = 30.dp), onMusic)
-        // Reddit: botão dos comentários salvos
-        if (isReddit && !uiHidden) CommentsButton(post,
-            Modifier.align(Alignment.BottomEnd).navigationBarsPadding().padding(end = 8.dp, bottom = 30.dp))
 
         // legenda: usuário + descrição (sem foto de perfil e sem degradê); some enquanto arrasta a linha do tempo
         if (!uiHidden) Column(Modifier.align(Alignment.BottomStart).navigationBarsPadding().padding(start = 14.dp, end = 72.dp, bottom = 46.dp)) {
-            Text(when { isTikTok -> "@${profile.username}"; isReddit -> profile.handle(); else -> profile.username },
+            Text(if (isTikTok) "@${profile.username}" else profile.username,
                 color = Color.White, fontWeight = FontWeight.Bold, fontSize = if (isTikTok) 17.sp else 15.sp)
             // Instagram: música escolhida para o post, embaixo do usuário (como no app)
             if (profile.platform == "instagram") MusicLine(post)
-            // Reddit: o título é o texto principal do post; o corpo (se houver) vem embaixo
-            if (isReddit && post.title.isNotBlank()) Text(post.title, color = Color.White, fontSize = 15.sp,
-                fontWeight = FontWeight.SemiBold, maxLines = if (expanded) 6 else 3, overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 6.dp).clickable { expanded = !expanded })
             if (post.description.isNotBlank()) Text(
                 post.description, color = Color.White, fontSize = 14.sp,
                 maxLines = if (expanded) 12 else 2, overflow = TextOverflow.Ellipsis,
@@ -350,67 +342,6 @@ private class FeedZoom(private val scope: kotlinx.coroutines.CoroutineScope) {
 private fun rememberFeedZoom(key: String): FeedZoom {
     val scope = rememberCoroutineScope()
     return remember(key) { FeedZoom(scope) }
-}
-
-// ───────────────────────── Comentários (Reddit) ─────────────────────────
-
-/** Balão com o nº de comentários; toque abre os comentários salvos do post. */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun CommentsButton(post: Post, modifier: Modifier) {
-    val dir = remember(post.key) { File(post.mediaPath).parentFile }
-    val id = post.key.substringAfter(':')
-    val count by produceState(-1L, post.key) {
-        value = withContext(Dispatchers.IO) {
-            runCatching { JSONObject(File(metaDir(dir!!), "$id.info.json").readText()).optLong("comment_count", -1) }.getOrDefault(-1L)
-        }
-    }
-    var show by remember { mutableStateOf(false) }
-    Column(modifier.clip(RoundedCornerShape(12.dp)).clickable { show = true }.padding(6.dp),
-        horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(painterResource(R.drawable.ic_comment), "Comentários", Modifier.size(30.dp), tint = Color.White)
-        if (count >= 0) Text(count.compact(), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-    }
-    if (show) ModalBottomSheet(onDismissRequest = { show = false }) {
-        val data by produceState<Pair<Long, List<Reddit.Comment>>?>(null, post.key) {
-            value = withContext(Dispatchers.IO) { dir?.let { Reddit.readComments(it, id) } ?: (0L to emptyList()) }
-        }
-        val d = data
-        Text(if (d == null) "Comentários" else "${d.first.compact()} comentários",
-            style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(start = 20.dp, bottom = 8.dp))
-        when {
-            d == null -> Box(Modifier.fillMaxWidth().height(160.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-            d.second.isEmpty() -> Text("Nenhum comentário salvo. Use \"Reverificar perfil\" para baixar os comentários.",
-                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(20.dp).navigationBarsPadding())
-            else -> LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(d.second.size) { i -> CommentRow(d.second[i]) }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CommentRow(c: Reddit.Comment) {
-    val line = MaterialTheme.colorScheme.outlineVariant
-    // recuo por nível com uma linha vertical por nível, como no Reddit
-    Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min).padding(start = 16.dp, end = 16.dp)) {
-        repeat(c.depth.coerceAtMost(8)) {
-            Box(Modifier.width(12.dp).fillMaxHeight()) { Box(Modifier.width(1.dp).fillMaxHeight().background(line)) }
-        }
-        if (c.more > 0) Text("+${c.more} respostas não salvas", style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(vertical = 6.dp))
-        else Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("u/${c.author}", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold,
-                    color = if (c.op) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                if (c.op) Text(" · OP", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                Text(" · ${c.score.compact()} pontos · ${c.time.date()}", style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-            Text(c.body, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 2.dp))
-        }
-    }
 }
 
 /** "♫ Artista · Música" do post (Instagram); some se o post não tem música. */

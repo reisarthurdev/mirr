@@ -11,21 +11,19 @@ import java.io.File
  * saíam sem login. No cookies.txt eles ficam em ".tiktok.com" e valem para todos os subdomínios.
  */
 object CookieStore {
-    val SITES = linkedMapOf("tiktok" to "TikTok", "instagram" to "Instagram", "x" to "X", "youtube" to "YouTube", "reddit" to "Reddit")
+    val SITES = linkedMapOf("tiktok" to "TikTok", "instagram" to "Instagram", "youtube" to "YouTube")
 
-    private val DOMAIN = mapOf("tiktok" to ".tiktok.com", "instagram" to ".instagram.com", "x" to ".x.com", "youtube" to ".youtube.com", "reddit" to ".reddit.com")
+    private val DOMAIN = mapOf("tiktok" to ".tiktok.com", "instagram" to ".instagram.com", "youtube" to ".youtube.com")
 
     /** Cookies típicos de cada site: identificam de onde veio a linha "a=b; c=d" colada. */
     private val SIGNATURE = mapOf(
         "tiktok" to setOf("ttwid", "tt_chain_token", "tt_csrf_token", "msToken", "sid_guard", "odin_tt"),
         "instagram" to setOf("ds_user_id", "ig_did", "mid", "rur", "shbid", "csrftoken"),
-        "x" to setOf("auth_token", "ct0", "twid", "guest_id", "kdt"),
-        "reddit" to setOf("reddit_session", "token_v2", "loid", "edgebucket", "csv", "session_tracker"),
         "youtube" to setOf("SAPISID", "__Secure-3PSID", "LOGIN_INFO", "VISITOR_INFO1_LIVE", "HSID", "SID"),
     )
 
     /** Cookie que só existe com conta logada. */
-    private val LOGIN = mapOf("tiktok" to "sessionid", "instagram" to "sessionid", "x" to "auth_token", "youtube" to "SAPISID", "reddit" to "reddit_session")
+    private val LOGIN = mapOf("tiktok" to "sessionid", "instagram" to "sessionid", "youtube" to "SAPISID")
 
     private const val YEAR_S = 365L * 24 * 3600
 
@@ -38,9 +36,7 @@ object CookieStore {
         when {
             "tiktok" in it -> "tiktok"
             "instagram" in it -> "instagram"
-            "twitter" in it || it.trimStart('.') == "x.com" || it.endsWith(".x.com") -> "x"
             "youtube" in it || "google" in it -> "youtube"
-            "reddit" in it -> "reddit"
             else -> null
         }
     }
