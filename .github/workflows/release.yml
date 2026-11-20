@@ -1,0 +1,49 @@
+name: Release APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build release APK
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Rename APK
+        run: |
+          VC=$(( GITHUB_RUN_NUMBER + 1000 ))
+          echo "VC=$VC" >> "$GITHUB_ENV"
+          cp app/build/outputs/apk/release/app-release.apk "mirr-$VC.apk"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ env.VC }}
+          name: mirr build ${{ env.VC }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            versionCode ${{ env.VC }} · commit ${{ github.sha }}
+            ${{ github.event.head_commit.message }}
+          files: mirr-${{ env.VC }}.apk
+          make_latest: true
