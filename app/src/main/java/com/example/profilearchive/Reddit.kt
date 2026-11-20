@@ -49,67 +49,154 @@ object Reddit {
         return t.takeIf { exp == 0L || exp * 1000 > System.currentTimeMillis() + 60_000 }
     }
 
+    /** Interpreta o corpo: JSON (objeto ou lista) ou null se veio uma página (bloqueio). */
+    private fun parse(body: String): Any? {
+        val s = body.trimStart()
+        return when {
+            s.startsWith("[") -> runCatching { JSONArray(s) }.getOrNull()
+            s.startsWith("{") -> runCatching { JSONObject(s) }.getOrNull()
+            else -> null
+        }
+    }
+
     /**
      * GET de JSON. O Reddit informa quantas consultas restam (x-ratelimit-remaining) e quando o limite
      * zera (x-ratelimit-reset, em segundos): acabando, espera em vez de levar 429.
-     * Ordem das tentativas: oauth.reddit.com com o token_v2 dos cookies (rota do site logado, a que o
-     * Reddit não bloqueia), depois www e old.reddit com os cookies e um User-Agent de app, e por
-     * último os mesmos com User-Agent de navegador.
+     * Ordem das tentativas:
+     *  1. oauth.reddit.com com o token_v2 dos cookies (a rota do site logado);
+     *  2. uma WebView (Chromium de verdade, com os cookies) pedindo o .json de dentro do reddit.com:
+     *     o bloqueio do Reddit é para clientes que não são navegador, e ela é um navegador;
+     *  3. www e old.reddit por HTTP simples, com User-Agent de app e de navegador.
      */
     private fun get(ctx: Context, pathAndQuery: String, onWait: (String) -> Unit): Any {
         val cookies = CookieStore.cookiesOf(ctx, "reddit")
         val cookie = cookies.joinToString("; ") { "${it.name}=${it.value}" }
         val token = bearer(cookies)
-        data class Try(val host: String, val ua: String, val auth: Boolean)
-        val tries = buildList {
-            if (token != null) { add(Try("https://oauth.reddit.com", APP_UA, true)); add(Try("https://oauth.reddit.com", APP_UA, true)) }
-            add(Try("https://www.reddit.com", APP_UA, false)); add(Try("https://old.reddit.com", APP_UA, false))
-            add(Try("https://www.reddit.com", UA, false)); add(Try("https://old.reddit.com", UA, false))
-        }
         var lastStatus = 0
-        for (t in tries) {
-            val c = URL("${t.host}/$pathAndQuery").openConnection() as HttpURLConnection
+
+        fun waitLimit(remaining: Double?, reset: Long) {
+            if (remaining != null && remaining < 2) { onWait("Limite do Reddit, continuando em ${reset + 1} s…"); Thread.sleep((reset + 1) * 1000) }
+        }
+
+        // 1) oauth com o token do site
+        if (token != null) for (attempt in 0..1) {
+            val c = URL("https://oauth.reddit.com/$pathAndQuery").openConnection() as HttpURLConnection
             try {
                 c.connectTimeout = 15_000; c.readTimeout = 30_000
-                c.instanceFollowRedirects = true
-                c.setRequestProperty("User-Agent", t.ua)
+                c.setRequestProperty("User-Agent", APP_UA)
                 c.setRequestProperty("Accept", "application/json")
-                if (t.auth) c.setRequestProperty("Authorization", "Bearer $token")
-                else if (cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
+                c.setRequestProperty("Authorization", "Bearer $token")
                 lastStatus = c.responseCode
-                val remaining = c.getHeaderField("x-ratelimit-remaining")?.toDoubleOrNull()
-                val reset = c.getHeaderField("x-ratelimit-reset")?.toLongOrNull() ?: 60
+                val reset = c.getHeaderField("x-ratelimit-reset")?.toLongOrNull()?.coerceAtMost(120) ?: 60
                 when (lastStatus) {
                     200 -> {
-                        val body = c.inputStream.bufferedReader().use { it.readText() }
-                        if (remaining != null && remaining < 2) { onWait("Limite do Reddit, continuando em ${reset + 1} s…"); Thread.sleep((reset + 1) * 1000) }
-                        val s = body.trimStart()
-                        when {
-                            s.startsWith("[") -> return JSONArray(s)
-                            s.startsWith("{") -> return JSONObject(s)
-                            else -> {}                              // página de bloqueio: tenta a próxima rota
-                        }
+                        val r = parse(c.inputStream.bufferedReader().use { it.readText() })
+                        if (r != null) { waitLimit(c.getHeaderField("x-ratelimit-remaining")?.toDoubleOrNull(), reset); return r }
+                        break
                     }
-                    429 -> { onWait("O Reddit pediu uma pausa, continuando em ${reset.coerceAtMost(120) + 1} s…"); Thread.sleep((reset.coerceAtMost(120) + 1) * 1000) }
+                    429 -> { onWait("O Reddit pediu uma pausa, continuando em ${reset + 1} s…"); Thread.sleep((reset + 1) * 1000) }
                     404 -> throw Failed("Não encontrado no Reddit (o nome está certo?)")
-                    else -> {}                                      // 401/403/5xx: próxima rota
+                    else -> break
                 }
-            } catch (e: java.io.IOException) {
-                lastStatus = -1
-            } finally { c.disconnect() }
+            } catch (e: java.io.IOException) { lastStatus = -1; break } finally { c.disconnect() }
         }
+
+        // 2) WebView
+        for (attempt in 0..2) {
+            val r = RedditWeb.fetch(ctx, cookies, "https://www.reddit.com/$pathAndQuery") ?: break   // WebView indisponível
+            lastStatus = r.status
+            when (r.status) {
+                200 -> { parse(r.body)?.let { waitLimit(r.remaining, r.reset); return it }; break }
+                429 -> { onWait("O Reddit pediu uma pausa, continuando em ${r.reset + 1} s…"); Thread.sleep((r.reset + 1) * 1000) }
+                404 -> throw Failed("Não encontrado no Reddit (o nome está certo?)")
+                else -> break
+            }
+        }
+
+        // 3) HTTP simples
+        for ((host, ua) in listOf("https://www.reddit.com" to APP_UA, "https://old.reddit.com" to APP_UA,
+                "https://www.reddit.com" to UA, "https://old.reddit.com" to UA)) {
+            val c = URL("$host/$pathAndQuery").openConnection() as HttpURLConnection
+            try {
+                c.connectTimeout = 15_000; c.readTimeout = 30_000
+                c.setRequestProperty("User-Agent", ua)
+                c.setRequestProperty("Accept", "application/json")
+                if (cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
+                val st = c.responseCode
+                if (lastStatus == 0 || st != 403) lastStatus = st
+                when (st) {
+                    200 -> parse(c.inputStream.bufferedReader().use { it.readText() })?.let { return it }
+                    404 -> throw Failed("Não encontrado no Reddit (o nome está certo?)")
+                }
+            } catch (e: java.io.IOException) { if (lastStatus == 0) lastStatus = -1 } finally { c.disconnect() }
+        }
+
         val hasLogin = cookies.any { it.name == "reddit_session" || it.name == "token_v2" }
         throw Failed(when {
-            lastStatus == 403 && token == null && hasLogin ->
-                "O Reddit recusou o acesso. Os cookies colados não têm um \"token_v2\" válido (ele vence em ~1 dia): abra o reddit.com logado no navegador e cole os cookies de novo"
-            lastStatus == 403 && hasLogin ->
-                "O Reddit recusou o acesso mesmo com os cookies (subreddit privado/banido, ou a sessão expirou: cole os cookies de novo)"
-            lastStatus == 403 -> "O Reddit recusou o acesso (perfil privado, banido ou bloqueio de rede). Cole os cookies do Reddit nas Configurações"
             lastStatus == 429 -> "O Reddit limitou as consultas. Tente de novo em alguns minutos"
             lastStatus == -1 -> "Sem conexão com o Reddit"
+            lastStatus == 403 || lastStatus == 401 || lastStatus == 200 -> if (hasLogin)
+                "O Reddit recusou o acesso mesmo com os cookies (subreddit privado/banido, ou a sessão expirou: abra o reddit.com logado no navegador e cole os cookies de novo)"
+                else "O Reddit recusou o acesso (perfil privado, banido ou bloqueio de rede). Cole os cookies do Reddit nas Configurações"
             else -> "O Reddit respondeu HTTP $lastStatus"
         })
     }
+
+    // ───────── vídeos (v.redd.it) ─────────
+
+    /**
+     * Formatos do vídeo lidos do manifesto DASH do v.redd.it (melhor vídeo + melhor áudio, que o Reddit
+     * serve separados; o yt-dlp junta). Assim o vídeo baixa direto, sem o yt-dlp abrir a página do post,
+     * que o Reddit bloqueia. null = manifesto indisponível.
+     */
+    fun videoFormats(dashUrl: String): JSONArray? = runCatching {
+        val c = URL(dashUrl).openConnection() as HttpURLConnection
+        val xml = try {
+            c.connectTimeout = 15_000; c.readTimeout = 30_000
+            c.setRequestProperty("User-Agent", UA)
+            if (c.responseCode != 200) return null
+            c.inputStream.bufferedReader().use { it.readText() }
+        } finally { c.disconnect() }
+        val base = dashUrl.substringBefore('?').substringBeforeLast('/') + "/"
+        class Rep(val video: Boolean, val w: Int, val h: Int, val bw: Long, val url: String)
+        val reps = ArrayList<Rep>()
+        val px = android.util.Xml.newPullParser().apply { setInput(java.io.StringReader(xml)) }
+        var setMime = ""
+        var cur: Array<Any?>? = null           // mime, w, h, bw, baseURL
+        var inBase = false
+        while (px.next() != org.xmlpull.v1.XmlPullParser.END_DOCUMENT) {
+            when (px.eventType) {
+                org.xmlpull.v1.XmlPullParser.START_TAG -> when (px.name) {
+                    "AdaptationSet" -> setMime = px.getAttributeValue(null, "mimeType") ?: px.getAttributeValue(null, "contentType") ?: ""
+                    "Representation" -> cur = arrayOf(
+                        px.getAttributeValue(null, "mimeType") ?: setMime,
+                        px.getAttributeValue(null, "width")?.toIntOrNull() ?: 0,
+                        px.getAttributeValue(null, "height")?.toIntOrNull() ?: 0,
+                        px.getAttributeValue(null, "bandwidth")?.toLongOrNull() ?: 0L, null)
+                    "BaseURL" -> inBase = cur != null
+                }
+                org.xmlpull.v1.XmlPullParser.TEXT -> if (inBase) cur?.set(4, px.text.trim())
+                org.xmlpull.v1.XmlPullParser.END_TAG -> when (px.name) {
+                    "BaseURL" -> inBase = false
+                    "Representation" -> cur?.let { r ->
+                        val u = (r[4] as String?)?.takeIf { it.isNotBlank() }
+                        if (u != null) reps += Rep((r[0] as String).startsWith("video"), r[1] as Int, r[2] as Int, r[3] as Long,
+                            if (u.startsWith("http")) u else base + u)
+                        cur = null
+                    }
+                }
+            }
+        }
+        val v = reps.filter { it.video }.maxWithOrNull(compareBy<Rep>({ it.h }, { it.bw })) ?: return null
+        val a = reps.filter { !it.video }.maxByOrNull { it.bw }
+        JSONArray().apply {
+            put(JSONObject().put("url", v.url).put("ext", "mp4").put("format_id", "dash-v")
+                .put("width", v.w).put("height", v.h).put("tbr", v.bw / 1000.0).put("vcodec", "avc1")
+                .apply { if (a != null) put("acodec", "none") })
+            if (a != null) put(JSONObject().put("url", a.url).put("ext", "m4a").put("format_id", "dash-a")
+                .put("tbr", a.bw / 1000.0).put("vcodec", "none").put("acodec", "mp4a"))
+        }
+    }.getOrNull()
 
     // ───────── listagem ─────────
 
@@ -238,6 +325,7 @@ object Reddit {
             } else {
                 putOpt("width", video!!.optInt("width").takeIf { it > 0 }); putOpt("height", video.optInt("height").takeIf { it > 0 })
                 putOpt("duration", video.optInt("duration").takeIf { it > 0 })
+                putOpt("pa_dash", video.optString("dash_url").takeIf { it.startsWith("http") })
             }
         }
     }
@@ -306,5 +394,73 @@ object Reddit {
         }
         walk(j.optJSONArray("comments"), 0)
         return j.optLong("count") to out
+    }
+}
+
+/**
+ * WebView invisível (sem tela) que pede o .json do Reddit de dentro do próprio reddit.com, com os
+ * cookies colados. Fica viva entre as consultas de uma verificação e é destruída 90 s depois da última.
+ * Chamar fora da thread principal: espera a resposta.
+ */
+@android.annotation.SuppressLint("SetJavaScriptEnabled")
+internal object RedditWeb {
+    class Res(val status: Int, val body: String, val remaining: Double?, val reset: Long)
+
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    private var web: android.webkit.WebView? = null
+    private var page: java.util.concurrent.CompletableFuture<Boolean>? = null
+    private val pending = java.util.concurrent.ConcurrentHashMap<Int, java.util.concurrent.CompletableFuture<Res>>()
+    private val ids = java.util.concurrent.atomic.AtomicInteger()
+    private val stop = Runnable { web?.destroy(); web = null; page = null }
+
+    class Bridge {
+        @android.webkit.JavascriptInterface
+        fun done(id: Int, status: Int, remaining: String?, reset: String?, body: String?) {
+            pending.remove(id)?.complete(Res(status, body.orEmpty(), remaining?.toDoubleOrNull(), reset?.toDoubleOrNull()?.toLong()?.coerceIn(1, 120) ?: 60))
+        }
+    }
+
+    /** null = WebView indisponível neste aparelho (ou não carregou). */
+    fun fetch(ctx: Context, cookies: List<CookieStore.Cookie>, url: String): Res? {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) return null
+        val ready = java.util.concurrent.CompletableFuture<java.util.concurrent.CompletableFuture<Boolean>?>()
+        main.post {
+            main.removeCallbacks(stop)
+            try {
+                if (web == null) {
+                    val cm = android.webkit.CookieManager.getInstance()
+                    cm.setAcceptCookie(true)
+                    cookies.forEach { c -> cm.setCookie("https://www.reddit.com", "${c.name}=${c.value}; Domain=.reddit.com; Path=/; Secure") }
+                    cm.flush()
+                    val loaded = java.util.concurrent.CompletableFuture<Boolean>()
+                    page = loaded
+                    web = android.webkit.WebView(ctx.applicationContext).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.blockNetworkImage = true
+                        addJavascriptInterface(Bridge(), "PA")
+                        webViewClient = object : android.webkit.WebViewClient() {
+                            override fun onPageFinished(view: android.webkit.WebView, u: String) { loaded.complete(true) }
+                        }
+                        loadUrl("https://www.reddit.com/robots.txt")
+                    }
+                }
+                ready.complete(page)
+            } catch (e: Throwable) { ready.complete(null) }
+        }
+        val loaded = runCatching { ready.get(15, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() ?: return null
+        if (runCatching { loaded.get(25, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() != true) { main.post(stop); return null }
+
+        val id = ids.incrementAndGet()
+        val f = java.util.concurrent.CompletableFuture<Res>()
+        pending[id] = f
+        val js = "fetch(" + JSONObject.quote(url) + ",{credentials:'include',headers:{'Accept':'application/json'}})" +
+            ".then(function(r){return r.text().then(function(t){PA.done($id,r.status,r.headers.get('x-ratelimit-remaining'),r.headers.get('x-ratelimit-reset'),t)})})" +
+            ".catch(function(e){PA.done($id,-1,null,null,String(e))});void 0"
+        main.post { web?.evaluateJavascript(js, null) ?: pending.remove(id)?.complete(Res(-1, "", null, 60)) }
+        val res = runCatching { f.get(45, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()
+        pending.remove(id)
+        main.postDelayed(stop, 90_000)
+        return res ?: Res(-1, "", null, 60)
     }
 }

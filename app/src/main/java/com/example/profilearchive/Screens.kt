@@ -3,6 +3,10 @@
 package com.example.profilearchive
 
 import kotlinx.coroutines.coroutineScope
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.FocusRequester
+import kotlinx.coroutines.flow.first
 
 import android.net.Uri
 import androidx.compose.ui.res.painterResource
@@ -333,6 +337,10 @@ fun HomeScreen(nav: NavController, openMenu: () -> Unit) {
         // Os ids já vistos ficam fora da tela (HomeScroll): voltar para a tela inicial não conta como novo.
         val active = works.filter { it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED }.map { it.id }
         suspend fun toTop() = coroutineScope {
+            // voltando da tela "Adicionar" a lista ainda nem foi medida (e a posição salva é restaurada na
+            // 1ª medida, desfazendo uma rolagem feita antes): espera ela ter itens e um quadro desenhado
+            snapshotFlow { list.layoutInfo.totalItemsCount }.first { it > 0 }
+            withFrameNanos { }
             launch { list.animateScrollToItem(0) }
             animate(scroll.state.heightOffset, 0f) { v, _ -> scroll.state.heightOffset = v }
             scroll.state.contentOffset = 0f
@@ -747,12 +755,16 @@ fun AddScreen(nav: NavController, openMenu: () -> Unit) {
     val ctx = LocalContext.current
     var url by remember { mutableStateOf("") }
     val target = parseProfileUrl(url)
+    // já abre com o campo selecionado e o teclado na tela
+    val focus = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    LaunchedEffect(Unit) { withFrameNanos { }; focus.requestFocus(); keyboard?.show() }
     Scaffold(topBar = {
         TopAppBar(title = { Text("Adicionar perfil") },
             navigationIcon = { IconButton(openMenu) { Icon(Icons.Default.Menu, "Menu") } })
     }) { pad ->
         Column(Modifier.padding(pad).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth(), singleLine = true,
+            OutlinedTextField(url, { url = it }, Modifier.fillMaxWidth().focusRequester(focus), singleLine = true,
                 label = { Text("Link do perfil (YouTube, TikTok, Instagram, X ou Reddit)") },
                 supportingText = {
                     Text(target?.let { "Detectado: ${it.label} · @${it.username}" + if (it.seed != null) " (pelo vídeo)" else "" }

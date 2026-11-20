@@ -510,9 +510,13 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
                     }
                     // a) posts de fotos identificados na listagem
                     downloadPhotos(stillMissing().filter { it.isPhotoPost }.map { it.id to it.raw })
-                    // b) TikTok e Instagram: vídeos com links já na listagem baixam direto, sem abrir uma página
-                    //    por vídeo (mais rápido e, no Instagram, é o que evita o bloqueio 429)
-                    if (t.platform == "tiktok" || t.platform == "instagram")
+                    // Reddit: links do vídeo e do áudio vêm do manifesto DASH do v.redd.it (o yt-dlp abriria a
+                    // página do post, que o Reddit bloqueia)
+                    if (t.platform == "reddit") stillMissing().filter { !it.isPhotoPost && !it.hasDirectLinks && it.raw.str("pa_dash") != null }
+                        .forEach { e -> ensureActive(); Reddit.videoFormats(e.raw.str("pa_dash")!!)?.let { e.raw.put("pa_formats", it) } }
+                    // b) TikTok, Instagram e Reddit: vídeos com links já na listagem baixam direto, sem abrir uma
+                    //    página por vídeo (mais rápido e, no Instagram, é o que evita o bloqueio 429)
+                    if (t.platform == "tiktok" || t.platform == "instagram" || t.platform == "reddit")
                         parallelDownload(stillMissing().filter { !it.isPhotoPost && it.hasDirectLinks }, direct = true, round = 0)
                     // c) o resto (e o que falhou acima) pelo caminho normal, com novas tentativas
                     // (Instagram: 1 rodada só; cada página de post conta para o limite de consultas)
@@ -523,7 +527,7 @@ class DownloadWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(c
                         parallelDownload(rest, direct = false, round = round)
                     }
                     // d) outros sites: o que o caminho normal não conseguiu (ex.: Instagram pedindo login) tenta pelos links da listagem
-                    if (t.platform != "tiktok" && t.platform != "instagram")
+                    if (t.platform != "tiktok" && t.platform != "instagram" && t.platform != "reddit")
                         parallelDownload(stillMissing().filter { !it.isPhotoPost && it.hasDirectLinks }, direct = true, round = 9)
                     // d) TikTok: o que veio sem vídeo ou só com a música é post de fotos. Rebaixa os metadados
                     //    (o plugin acrescenta as fotos) e baixa as fotos + música juntas
