@@ -845,13 +845,13 @@ fun SettingsScreen(nav: NavController) {
                 val labels = listOf("Sistema", "Claro", "Escuro")
                 SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                     labels.forEachIndexed { i, l ->
-                        SegmentedButton(ThemeState.mode == i, { ThemeState.mode = i; prefs.themeMode = i },
+                        SegmentedButton(ThemeState.mode == i, { ThemeState.change { ThemeState.mode = i }; prefs.themeMode = i },
                             SegmentedButtonDefaults.itemShape(i, labels.size)) { Text(l) }
                     }
                 }
                 if (Build.VERSION.SDK_INT >= 31) Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Cores dinâmicas (Material You)", Modifier.weight(1f))
-                    Switch(ThemeState.dynamic, { ThemeState.dynamic = it; prefs.dynamic = it })
+                    Switch(ThemeState.dynamic, { v -> ThemeState.change { ThemeState.dynamic = v }; prefs.dynamic = v })
                 }
             }
 

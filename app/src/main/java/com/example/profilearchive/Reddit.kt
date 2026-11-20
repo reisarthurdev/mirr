@@ -127,16 +127,17 @@ object Reddit {
         }
 
         // 3) HTTP simples
-        for ((host, ua) in listOf("https://www.reddit.com" to APP_UA, "https://old.reddit.com" to APP_UA,
-                "https://www.reddit.com" to UA, "https://old.reddit.com" to UA)) {
+        for ((host, ua, withCookies) in listOf(Triple("https://www.reddit.com", APP_UA, true), Triple("https://old.reddit.com", APP_UA, true),
+                Triple("https://www.reddit.com", UA, true), Triple("https://old.reddit.com", UA, true),
+                Triple("https://www.reddit.com", APP_UA, false), Triple("https://old.reddit.com", UA, false))) {
             val c = URL("$host/$pathAndQuery").openConnection() as HttpURLConnection
             try {
                 c.connectTimeout = 15_000; c.readTimeout = 30_000
                 c.setRequestProperty("User-Agent", ua)
                 c.setRequestProperty("Accept", "application/json")
-                if (cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
+                if (withCookies && cookie.isNotEmpty()) c.setRequestProperty("Cookie", cookie)
                 val st = c.responseCode
-                trace += "${host.removePrefix("https://").substringBefore('.')} $st"
+                trace += "${host.removePrefix("https://").substringBefore('.')}${if (withCookies) "" else " sem cookies"} $st"
                 if (lastStatus == 0 || st != 403) lastStatus = st
                 when (st) {
                     200 -> parse(c.inputStream.bufferedReader().use { it.readText() })?.let { return it }
@@ -244,9 +245,10 @@ object Reddit {
         val direct = try { listDirect(ctx, username, onProgress) } catch (e: Failed) {
             if ("Não encontrado" in e.message.orEmpty()) throw e
             onProgress("O Reddit recusou o acesso; buscando no arquivo público (Arctic Shift)…")
-            return try { Arctic.list(username, onProgress) } catch (a: Failed) {
-                throw Failed("${e.message}\n\nArquivo público (Arctic Shift) também falhou: ${a.message}")
-            }
+            val arctic = try { return Arctic.list(username, onProgress) } catch (a: Failed) { a.message }
+            onProgress("Arctic Shift falhou; tentando o PullPush…")
+            val pull = try { return PullPush.list(username, onProgress) } catch (p: Failed) { p.message }
+            throw Failed("${e.message}\n\nArquivos públicos também falharam: Arctic Shift ($arctic); PullPush ($pull)")
         }
         return direct
     }
@@ -478,6 +480,9 @@ internal object RedditWeb {
             // UA do Chrome de verdade (sem o "; wv" e o "Version/4.0" que denunciam a WebView)
             settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/\\S+ "), "")
             cm.setAcceptThirdPartyCookies(this, true)
+            // a WebView manda "X-Requested-With: <pacote do app>" em cada pedido; lista vazia = não manda
+            if (androidx.webkit.WebViewFeature.isFeatureSupported(androidx.webkit.WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST))
+                androidx.webkit.WebSettingsCompat.setRequestedWithHeaderOriginAllowList(settings, emptySet())
             addJavascriptInterface(Bridge(), "PA")
             webViewClient = object : android.webkit.WebViewClient() {
                 override fun onReceivedHttpError(view: android.webkit.WebView, req: android.webkit.WebResourceRequest,
@@ -624,4 +629,62 @@ internal object Arctic {
 
     /** Árvore de comentários de um post (formato do Reddit: {kind, data{…, replies}}). */
     fun comments(id: String): JSONArray = get("/api/comments/tree?link_id=t3_$id&limit=9999").optJSONArray("data") ?: JSONArray()
+}
+
+/**
+ * PullPush (api.pullpush.io): outro arquivo público do Reddit, no formato do antigo Pushshift.
+ * Segunda opção quando o Reddit e o Arctic Shift falham. Só posts (os comentários ficam com o Arctic).
+ */
+internal object PullPush {
+    private const val BASE = "https://api.pullpush.io/reddit/search/submission/"
+    private const val UA = "android:com.example.profilearchive:v2.0 (archive app)"
+
+    private fun page(query: String): JSONArray {
+        var last = ""
+        for (attempt in 0..3) {
+            val c = URL("$BASE?$query").openConnection() as HttpURLConnection
+            try {
+                c.connectTimeout = 15_000; c.readTimeout = 60_000
+                c.setRequestProperty("User-Agent", UA)
+                val st = c.responseCode
+                val body = (if (st < 400) c.inputStream else c.errorStream)?.bufferedReader()?.use { it.readText() }.orEmpty()
+                when (st) {
+                    200 -> return runCatching { JSONObject(body).optJSONArray("data") }.getOrNull() ?: throw Reddit.Failed("resposta inválida")
+                    429 -> { last = "HTTP 429"; Thread.sleep(5_000L * (attempt + 1)) }
+                    else -> {
+                        last = "HTTP $st " + body.replace(Regex("\\s+"), " ").take(100)
+                        if (st in 400..499) throw Reddit.Failed(last.trim())
+                        Thread.sleep(3000)
+                    }
+                }
+            } catch (e: java.io.IOException) { last = "sem conexão"; Thread.sleep(2000) } finally { c.disconnect() }
+        }
+        throw Reddit.Failed(last.ifBlank { "sem resposta" })
+    }
+
+    fun list(username: String, onProgress: (String) -> Unit): List<JSONObject> {
+        val name = java.net.URLEncoder.encode(Reddit.nameOf(username), "UTF-8")
+        val who = if (Reddit.isSubreddit(username)) "subreddit=$name" else "author=$name"
+        val out = LinkedHashMap<String, JSONObject>()
+        var before: Long? = null
+        var seen = 0
+        for (p in 1..100) {
+            onProgress("Listando posts no PullPush… ${out.size} com mídia de $seen")
+            val data = try { page("$who&size=100&sort=desc&sort_type=created_utc" + (before?.let { "&before=$it" } ?: "")) }
+                catch (e: Reddit.Failed) { if (out.isEmpty()) throw e; break }
+            if (data.length() == 0) break
+            var oldest = Long.MAX_VALUE
+            for (i in 0 until data.length()) {
+                val post = data.optJSONObject(i) ?: continue
+                seen++
+                post.optLong("created_utc").takeIf { it > 0 }?.let { oldest = minOf(oldest, it) }
+                Reddit.toEntry(post, JSONObject())?.let { out.putIfAbsent(it.getString("id"), it) }
+            }
+            if (oldest == Long.MAX_VALUE || oldest == before) break
+            before = oldest
+            Thread.sleep(1000)
+        }
+        if (seen == 0) throw Reddit.Failed("nada arquivado para ${Reddit.handle(username)}")
+        return out.values.toList()
+    }
 }
